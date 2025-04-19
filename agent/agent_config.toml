@@ -1,0 +1,19 @@
+[scanner]
+max_file_size_mb = 50
+executable_extensions = ["exe", "dll", "sys", "ocx"]
+
+[risk_groups.high]
+scheduled_interval = 60
+directories = ["C:\\Users\\Noel\\Downloads", "C:\\Programs"]
+
+[risk_groups.medium]
+scheduled_interval = 300
+directories = ["C:\\Users\\Noel\\Documents"]
+
+[risk_groups.low]
+# No scheduled_interval means manual scanning.
+directories = ["C:\\Users\\Noel\\SomeManualDir"]
+
+[risk_groups.special]
+# No scheduled_interval means manual scanning.
+directories = ["C:\\Users\\Noel\\SpecialDir"]

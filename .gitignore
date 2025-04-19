@@ -1,0 +1,45 @@
+# === Rust (for agent folder) ===
+/target
+**/*.rs.bk
+
+# === Cargo-related ===
+**/Cargo.lock
+/.cargo/
+.cargo/
+.cargo-target/
+
+# === VSCode ===
+.vscode/
+*.code-workspace
+
+# === desktop-app (Node) ===
+desktop-app/node_modules/
+desktop-app/dist/
+desktop-app/.vite/
+desktop-app/.output/
+desktop-app/.cache/
+
+# === desktop-app (Tauri) ===
+desktop-app/src-tauri/target/
+desktop-app/src-tauri/.cargo/
+desktop-app/src-tauri/Cargo.lock
+
+# === agent ===
+agent/target/
+agent/.cargo
+agent/Cargo.lock
+agent/persistent_cache.json
+
+
+# === Logs and OS files ===
+*.log
+.DS_Store
+Thumbs.db
+
+# === Env files ===
+*.env
+*.env.*
+
+# === Build Artifacts ===
+/pkg/
+*.wasm
