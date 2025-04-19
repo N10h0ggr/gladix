@@ -21,6 +21,7 @@ desktop-app/.cache/
 
 # === desktop-app (Tauri) ===
 desktop-app/src-tauri/target/
+desktop-app/src-tauri/gen/
 desktop-app/src-tauri/.cargo/
 desktop-app/src-tauri/Cargo.lock
 

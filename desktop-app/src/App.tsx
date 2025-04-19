@@ -13,6 +13,7 @@ export default function Page() {
           <AppSidebar variant="inset" />
           <SidebarInset className="overflow-auto">
             <Routes>
+              <Route path="/" element={<DashboardPage />} />
               <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/policies" element={<PoliciesPage />} />
             </Routes>
