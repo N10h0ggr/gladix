@@ -25,11 +25,17 @@ desktop-app/src-tauri/gen/
 desktop-app/src-tauri/.cargo/
 desktop-app/src-tauri/Cargo.lock
 
-# === agent ===
-agent/target/
-agent/.cargo
-agent/Cargo.lock
-agent/persistent_cache.json
+# === user agent ===
+user-agent/target/
+user-agent/.cargo
+user-agent/Cargo.lock
+user-agent/persistent_cache.json
+
+# === kernel driver ===
+kernel-driver/target/
+kernel-driver/.cargo
+kernel-driver/Cargo.lock
+kernel-driver/*.inx
 
 
 # === Logs and OS files ===

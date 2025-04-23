@@ -1,3 +1,16 @@
+//! Persistent file scan cache with HMAC integrity.
+//!
+//! This module implements a simple persistent cache for file scan results,
+//! using JSON serialization and HMAC-SHA256 signing to detect tampering.
+//! It stores metadata such as file hashes, modification times, and scan results.
+//!
+//! Key responsibilities:
+//! - Load and save cache data from/to disk.
+//! - Ensure integrity using HMAC signatures.
+//! - Serialize using path strings for portability.
+//! - Convert between PathBuf-based and string-based cache maps.
+
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

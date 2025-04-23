@@ -4,7 +4,7 @@ import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar"
 import { AppSidebar }                from "@/components/app-sidebar"
 
 import DashboardPage from "./pages/Dashboard"
-import PoliciesPage  from "./pages/Policies"
+import TelemetryPage from "./pages/Telemetry" 
 
 export default function Page() {
   return (
@@ -15,7 +15,7 @@ export default function Page() {
             <Routes>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/dashboard" element={<DashboardPage />} />
-              <Route path="/policies" element={<PoliciesPage />} />
+              <Route path="/telemetry" element={<TelemetryPage />} />
             </Routes>
           </SidebarInset>
       </SidebarProvider>
