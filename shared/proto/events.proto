@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package agent_telemetry;
+package events;
 
 import "google/protobuf/timestamp.proto";
 

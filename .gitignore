@@ -1,44 +1,30 @@
-# === Rust (for agent folder) ===
-/target
+# === Common Rust ===
+**/target/
+**/.cargo/
+**/Cargo.lock
 **/*.rs.bk
 
-# === Cargo-related ===
-**/Cargo.lock
-/.cargo/
-.cargo/
-.cargo-target/
-
-# === VSCode ===
-.vscode/
-*.code-workspace
-
-# === desktop-app (Node) ===
+# === Node.js (desktop-app) ===
 desktop-app/node_modules/
 desktop-app/dist/
 desktop-app/.vite/
 desktop-app/.output/
 desktop-app/.cache/
 
-# === desktop-app (Tauri) ===
+# === Tauri (desktop-app/src-tauri) ===
 desktop-app/src-tauri/target/
 desktop-app/src-tauri/gen/
-desktop-app/src-tauri/.cargo/
 desktop-app/src-tauri/Cargo.lock
 
-# === user agent ===
-user-agent/target/
-user-agent/.cargo
-user-agent/Cargo.lock
+# === Project-specific files ===
 user-agent/persistent_cache.json
-
-# === kernel driver ===
-kernel-driver/target/
-kernel-driver/.cargo
-kernel-driver/Cargo.lock
 kernel-driver/*.inx
 
+# === Editor ===
+.vscode/
+*.code-workspace
 
-# === Logs and OS files ===
+# === Logs and OS ===
 *.log
 .DS_Store
 Thumbs.db
@@ -47,6 +33,6 @@ Thumbs.db
 *.env
 *.env.*
 
-# === Build Artifacts ===
+# === WebAssembly / Build Artifacts ===
 /pkg/
 *.wasm

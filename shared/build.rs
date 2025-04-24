@@ -1,6 +1,6 @@
 fn main() {
-    let proto_files = &["resources/event.proto"];
-    let includes = &["resources"];
+    let proto_files = &["proto/events.proto"];
+    let includes = &["proto"];
 
     prost_build::Config::new()
         .out_dir("src/proto_gen")

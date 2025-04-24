@@ -31,9 +31,9 @@ use serde::{Deserialize, Serialize};
 use anyhow::{anyhow, Error as AnyhowError};
 use chrono::{DateTime, Utc, NaiveDateTime};
 use core::error::Error;
-use crate::proto_gen::agent_telemetry::base_event::Payload;
+use shared::events::base_event::Payload;
 
-use crate::proto_gen::agent_telemetry::{
+use shared::events::{
     BaseEvent as ProtoEvent,
     FileEvent as ProtoFileEvent,
     base_event,

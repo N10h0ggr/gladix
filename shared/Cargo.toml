@@ -1,0 +1,11 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+prost-build = "0.12"
+
+[dependencies]
+prost = "0.12"
+prost-types = "0.12"

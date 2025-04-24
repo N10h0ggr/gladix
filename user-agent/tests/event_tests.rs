@@ -28,7 +28,7 @@ use chrono::Utc;
 use prost::Message;
 use std::convert::TryFrom;
 use agent::comms::events::{Event, FileEvent, FileOperation};
-use agent::proto_gen::agent_telemetry::BaseEvent as ProtoEvent;
+use shared::events::BaseEvent as ProtoEvent;
 
 #[test]
 fn test_file_event_json_roundtrip() {

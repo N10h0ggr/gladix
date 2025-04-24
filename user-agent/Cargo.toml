@@ -18,3 +18,4 @@ chrono = { version = "0.4", features = ["serde"] }
 prost = "0.12"
 prost-types = "0.12"
 anyhow = "1.0"
+shared = { path = "../shared" }
