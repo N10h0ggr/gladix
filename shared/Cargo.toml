@@ -2,10 +2,18 @@
 name = "shared"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [build-dependencies]
-prost-build = "0.12"
+tonic-build = "0.12"
 
 [dependencies]
-prost = "0.12"
-prost-types = "0.12"
+# Must match the prost version tonic expects (0.13.x)
+prost       = "0.13.5"
+prost-types = "0.13.5"
+
+# gRPC runtime support
+tonic = { version = "0.12", features = ["transport"] }
+
+# Tokio for your gRPC tests
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

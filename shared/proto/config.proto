@@ -1,0 +1,91 @@
+// shared/proto/config.proto
+syntax = "proto3";
+
+package config;
+
+import "google/protobuf/empty.proto";
+
+// Scanner configuration (maps to scanner_config table)
+message ScannerConfig {
+  bool enabled            = 1;
+  uint32 interval_seconds = 2;
+  bool recursive          = 3;
+  // Comma-separated list of extensions, e.g. ".exe,.dll"
+  string file_extensions  = 4;
+  // List of root paths to scan
+  repeated string paths   = 5;
+}
+
+// Process sensor configuration (process_config table)
+message ProcessConfig {
+  bool enabled               = 1;
+  bool hook_creation         = 2;
+  bool hook_termination      = 3;
+  bool detect_remote_threads = 4;
+}
+
+// Filesystem sensor configuration (fs_config table)
+message FsConfig {
+  bool enabled         = 1;
+  uint32 filter_mask   = 2;             // bitmask of operations
+  repeated string path_whitelist = 3;   // JSON array of paths
+  repeated string path_blacklist = 4;   // JSON array of paths
+}
+
+// Network sensor configuration (network_config table)
+message NetworkConfig {
+  bool enabled      = 1;
+  bool inspect_dns  = 2;
+  repeated uint32 include_ports = 3;
+  repeated uint32 exclude_ports = 4;
+}
+
+// ETW sensor configuration (etw_config table)
+message EtwConfig {
+  bool enabled        = 1;
+  uint32 level        = 2;              // verbosity 1–5
+  uint64 keywords     = 3;              // bitmask
+  repeated string providers = 4;        // list of GUID strings
+}
+
+// “Union” of all sensor configs for a SetConfig call
+message ConfigUpdate {
+  ScannerConfig scanner = 1;
+  ProcessConfig process = 2;
+  FsConfig       fs      = 3;
+  NetworkConfig  network = 4;
+  EtwConfig      etw     = 5;
+}
+
+// Request to fetch current config
+message GetConfigRequest {
+  // empty
+}
+
+// Response containing all current configs
+message GetConfigResponse {
+  ScannerConfig scanner = 1;
+  ProcessConfig process = 2;
+  FsConfig       fs      = 3;
+  NetworkConfig  network = 4;
+  EtwConfig      etw     = 5;
+}
+
+// Request to set a full new configuration
+message SetConfigRequest {
+  ConfigUpdate config = 1;
+}
+
+// Response for SetConfig calls
+message SetConfigResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Service definition for UI ↔ Agent config RPCs
+service ConfigService {
+  // Fetch the current configuration
+  rpc GetConfig (GetConfigRequest) returns (GetConfigResponse);
+  // Apply a new configuration atomically
+  rpc SetConfig (SetConfigRequest) returns (SetConfigResponse);
+}

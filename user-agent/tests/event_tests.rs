@@ -5,10 +5,10 @@
 //!
 //! ## Covered Scenarios:
 //!
-//! - ✅ JSON round-trip (via `serde`) for event types like `FileEvent`
-//! - ✅ Protobuf round-trip (via `prost`) for the same event types
-//! - ✅ Structural consistency between internal Rust model and `.proto` schema
-//! - ✅ Field-level assertions (e.g., `path`, `pid`, `sha256`)
+//! - JSON round-trip (via `serde`) for event types like `FileEvent`
+//! - Protobuf round-trip (via `prost`) for the same event types
+//! - Structural consistency between internal Rust model and `.proto` schema
+//! - Field-level assertions (e.g., `path`, `pid`, `sha256`)
 //!
 //! These tests ensure that events can safely move between internal systems,
 //! logs, network interfaces, and database storage without data loss or mismatch.
