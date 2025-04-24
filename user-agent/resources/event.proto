@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package agent_telemetry;
+
+import "google/protobuf/timestamp.proto";
+
+message BaseEvent {
+  google.protobuf.Timestamp ts = 1;
+  string sensor_guid   = 2;
+  oneof payload {
+    FileEvent      file_event      = 10;
+    NetworkEvent   network_event   = 11;
+    ProcessEvent   process_event   = 12;
+    ScanResult     scan_result     = 13;
+    EtwEvent       etw_event       = 14;
+  }
+}
+
+message FileEvent {
+  enum Operation { CREATE = 0; WRITE = 1; DELETE = 2; RENAME = 3; }
+  Operation op       = 1;
+  string path        = 2;
+  string new_path    = 3;
+  uint32 pid         = 4;
+  string exe_path    = 5;
+  uint64 size        = 6;
+  bytes sha256       = 7;
+  bool success       = 8;
+}
+
+message NetworkEvent {
+  enum Direction { INBOUND = 0; OUTBOUND = 1; }
+  Direction direction  = 1;
+  string proto         = 2;
+  string src_ip        = 3;
+  uint32 src_port      = 4;
+  string dst_ip        = 5;
+  uint32 dst_port      = 6;
+  uint32 pid           = 7;
+  string exe_path      = 8;
+  uint64 bytes         = 9;
+  bool   blocked       = 10;
+}
+
+message ProcessEvent {
+  uint32 pid           = 1;
+  uint32 ppid          = 2;
+  string image_path    = 3;
+  string cmdline       = 4;
+}
+
+message ScanResult {
+  string rule_id       = 1;
+  string file_path     = 2;
+  repeated string matches = 3;
+  enum Severity { LOW = 0; MEDIUM = 1; HIGH = 2; CRITICAL = 3; }
+  Severity severity    = 4;
+}
+
+message EtwEvent {
+  string provider_guid = 1;
+  uint32 event_id      = 2;
+  uint32 level         = 3;
+  uint32 pid           = 4;
+  uint32 tid           = 5;
+  string json_payload  = 6;
+}

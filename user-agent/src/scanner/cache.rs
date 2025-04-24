@@ -20,6 +20,10 @@ use std::fs;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use sha2::digest::KeyInit;
+use std::sync::{Arc, Mutex};
+
+/// Shared in‐memory file cache for worker threads.
+pub type FileCache = Arc<Mutex<HashMap<PathBuf, FileCacheEntry>>>;
 
 // Type alias for our HMAC-SHA256.
 type HmacSha256 = Hmac<Sha256>;

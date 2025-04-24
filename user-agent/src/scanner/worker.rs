@@ -15,7 +15,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{UNIX_EPOCH};
+use std::io::ErrorKind;
+
 
 fn process_file(path: &Path, cache: &FileCache, max_size: u64, exts: &[String]) -> std::io::Result<()> {
     let meta = fs::metadata(path)?;
@@ -23,7 +25,11 @@ fn process_file(path: &Path, cache: &FileCache, max_size: u64, exts: &[String]) 
         return Ok(());
     }
 
-    let mtime = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+    let mtime = meta
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?
+        .as_secs();
     let hash = compute_file_hash(path)?;
 
     let mut lock = cache.lock().unwrap();

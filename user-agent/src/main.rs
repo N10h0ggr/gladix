@@ -17,26 +17,31 @@
 //! should be added.
 
 
-
-mod scanner;
-mod config;
-
 use std::path::PathBuf;
-use config::{load_master_config, convert_config_to_risk_group, DirectoryRisk};
-use scanner::run_scanner;
+use agent::config::{load_master_config, convert_config_to_risk_group};
+use agent::config::types::DirectoryRisk;
+use agent::scanner::run_scanner;
 
 fn main() {
     let master = load_master_config(PathBuf::from("agent_config.toml").as_path())
         .expect("Cannot read config");
 
-    let groups = [
-        convert_config_to_risk_group(DirectoryRisk::High,    master.risk_groups.high),
-        convert_config_to_risk_group(DirectoryRisk::Medium,  master.risk_groups.medium),
-        convert_config_to_risk_group(DirectoryRisk::Low,     master.risk_groups.low),
-        convert_config_to_risk_group(DirectoryRisk::Special, master.risk_groups.special),
+    let risk_levels = [
+        (DirectoryRisk::High,    master.scanner.high),
+        (DirectoryRisk::Medium,  master.scanner.medium),
+        (DirectoryRisk::Low,     master.scanner.low),
+        (DirectoryRisk::Special, master.scanner.special),
     ];
 
-    let scheduled: Vec<_> = groups.into_iter().filter(|g| g.scheduled_interval.is_some()).collect();
+    let groups: Vec<_> = risk_levels.into_iter()
+        .filter_map(|(risk, opt_cfg)| opt_cfg.map(|cfg| convert_config_to_risk_group(risk, cfg)))
+        .collect();
+
+    let scheduled: Vec<_> = groups
+        .into_iter()
+        .filter(|g| g.scheduled_interval.is_some())
+        .collect();
 
     run_scanner(scheduled, PathBuf::from("persistent_cache.json"));
 }
+

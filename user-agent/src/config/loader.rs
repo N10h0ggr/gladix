@@ -11,8 +11,15 @@
 //! - Provide a clean API to initialize scanning groups.
 
 
-use super::types::*;
-use std::path::Path;
+use crate::config::types::{
+    MasterConfig,
+    DirectoryRisk,
+    RiskGroupConfig,
+    RiskGroup,
+};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 
 /// Lee el TOML de disco y lo deserializa.
 pub fn load_master_config(path: &Path) -> Result<MasterConfig, Box<dyn std::error::Error>> {
@@ -24,7 +31,12 @@ pub fn load_master_config(path: &Path) -> Result<MasterConfig, Box<dyn std::erro
 pub fn convert_config_to_risk_group(risk: DirectoryRisk, cfg: RiskGroupConfig) -> RiskGroup {
     RiskGroup {
         risk,
-        directories: cfg.directories.into_iter().map(PathBuf::from).collect(),
-        scheduled_interval: cfg.scheduled_interval.map(Duration::from_secs),
+        directories: cfg.directories
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+        scheduled_interval: cfg
+            .scheduled_interval
+            .map(Duration::from_secs),
     }
 }

@@ -1,7 +1,10 @@
 [package]
-name = "Agent"
+name = "agent"
 version = "0.1.0"
 edition = "2024"
+
+[build-dependencies]
+prost-build = "0.12"
 
 [dependencies]
 twox-hash = "2.1"
@@ -11,3 +14,7 @@ hmac = "0.13.0-pre.5"
 sha2 = "0.11.0-pre.5"
 hex = "0.4.3"
 toml = "0.8.20"
+chrono = { version = "0.4", features = ["serde"] }
+prost = "0.12"
+prost-types = "0.12"
+anyhow = "1.0"
