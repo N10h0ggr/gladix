@@ -1,0 +1,19 @@
+[scanner]
+max_file_size_mb      = 50
+executable_extensions = ["exe", "dll", "sys", "ocx"]
+
+[scanner.high]
+scheduled_interval = 60
+directories        = ["C:\\Users\\Noel\\Downloads", "C:\\Programs"]
+
+[scanner.medium]
+scheduled_interval = 300
+directories        = ["C:\\Users\\Noel\\Documents"]
+
+[scanner.low]
+# manual only
+directories = ["C:\\Users\\Noel\\SomeManualDir"]
+
+[scanner.special]
+# manual only
+directories = ["C:\\Users\\Noel\\SpecialDir"]

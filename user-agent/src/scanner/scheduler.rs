@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration};
 
+
 /// Devuelve todos los ficheros de un directorio (de forma recursiva).
 fn list_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -41,31 +42,71 @@ fn list_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Punto único de entrada que expone el módulo.
-pub fn run_scanner(groups: Vec<RiskGroup>, cache_path: PathBuf) {
-    let cache = Arc::new(Mutex::new(load_persistent_cache(&cache_path)));
-    let exts = Arc::new(vec!["exe".into(), "dll".into(), "sys".into(), "ocx".into()]);
-    let max_size = 50 * 1024 * 1024; // 50 MB
 
-    for g in groups {
+/// Spawn one thread per group, run an immediate scan, then sleep.
+/// Spawns one thread per risk group. Each thread runs a scan immediately,
+/// then sleeps for `interval` seconds before repeating.
+pub fn run_scanner(groups: Vec<RiskGroup>, cache_path: PathBuf) {
+    // Load or initialize the on-disk cache
+    let cache = Arc::new(Mutex::new(load_persistent_cache(&cache_path)));
+
+    // Allowed executable extensions
+    let exts = Arc::new(vec!["exe".into(), "dll".into(), "sys".into(), "ocx".into()]);
+
+    // Maximum file size: 50 MB
+    let max_size = 50 * 1024 * 1024;
+
+    println!("run_scanner(): scheduling {} group(s)", groups.len());
+
+    for group in groups {
         let cache = Arc::clone(&cache);
         let exts = Arc::clone(&exts);
         let cache_file = cache_path.clone();
 
+        // Convert and filter out empty paths
+        let dirs: Vec<PathBuf> = group
+            .directories
+            .into_iter()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .collect();
+
+        // Interval to wait between scans
+        let interval: Duration = group.scheduled_interval
+            .expect("scheduled_interval must be set for each group");
+        let secs = interval.as_secs();
+
+        // Spawn a dedicated thread
         thread::spawn(move || {
-            let interval = g.scheduled_interval.unwrap();
+            println!("→ Scanner thread for {:?} starting (interval = {}s)", group.risk, secs);
+
             loop {
-                for dir in &g.directories {
+                println!("  [{:?}] Starting scan pass", group.risk);
+
+                for dir in &dirs {
+                    if !dir.exists() {
+                        println!("    [skip] directory does not exist: {:?}", dir);
+                        continue;
+                    }
+                    println!("    scanning {:?}", dir);
+
                     let files = list_files(dir);
+                    println!("    found {} candidates", files.len());
+
                     process_files(files, Arc::clone(&cache), max_size, Arc::clone(&exts));
                 }
+
+                // Persist cache each pass
                 save_persistent_cache(&cache_file, &*cache.lock().unwrap());
+                println!("  [{:?}] Cache written to {:?}", group.risk, cache_file);
+
+                println!("  [{:?}] Sleeping for {}s\n", group.risk, secs);
                 thread::sleep(interval);
             }
         });
     }
 
-    // bloqueamos el hilo principal
+    // Keep main thread alive
     loop {
         thread::sleep(Duration::from_secs(600));
     }
