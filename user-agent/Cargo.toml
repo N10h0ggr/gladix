@@ -16,6 +16,10 @@ prost = "0.13.5"
 prost-types = "0.13.5"
 anyhow = "1.0"
 shared = { path = "../shared" }
-windows-service = "0.8.0"
 log             = "0.4"
-eventlog        = "0.1.0"
+simplelog      = "0.12"
+windows-service = "0.8.0"
+
+[target.'cfg(windows)'.dependencies]
+eventlog       = "0.3.0"
+

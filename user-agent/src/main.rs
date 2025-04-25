@@ -1,58 +1,116 @@
-//! Windows service entry point for the Gladix User Agent Service.
+//! Windows service entrypoint for the Gladix User Agent Service.
 //!
-//! Installable as SYSTEM service, handles graceful startup/shutdown, loads config,
-//! initializes modules, and logs lifecycle to the Windows Event Log.
+//! Installs as a SYSTEM service, handles startup/shutdown, loads config, initializes logging.
 
-use std::ffi::OsString;
-use std::path::PathBuf;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+// Bring in the logging macro
+#[macro_use]
+mod macros;
+mod scanner;
+mod config;
+mod comms;
 
-use log::{error, info};
-use eventlog::{init, register, deregister};
-use windows_service::define_windows_service;
-use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-    ServiceType, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceAccess,
+
+use std::{ffi::OsString, path::PathBuf, sync::mpsc, thread, fs::File, process, time::Duration};
+use chrono::Local;
+use log::Level;
+use simplelog::{ConfigBuilder, LevelFilter, WriteLogger};
+use eventlog::init as event_init;
+use windows_service::{
+    define_windows_service,
+    service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType},
+    service_control_handler::{self, ServiceControlHandlerResult},
+    service_dispatcher::start,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
-use windows_service::service_dispatcher::start;
-use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use agent::config::{load_master_config, convert_config_to_risk_group};
-use agent::config::types::{MasterConfig, RiskGroup, DirectoryRisk};
-use agent::scanner::run_scanner;
+use crate::config::{load_master_config, convert_config_to_risk_group};
+use crate::config::types::{MasterConfig, RiskGroup, DirectoryRisk};
+use crate::scanner::run_scanner;
 
 const SERVICE_NAME: &str = "Gladix";
 const SERVICE_DISPLAY_NAME: &str = "Gladix User Agent Service";
 
 define_windows_service!(ffi_service_main, service_main);
 
-fn service_main(_args: Vec<OsString>) {
-    // Initialize Windows Event Log
-    init(SERVICE_DISPLAY_NAME, log::Level::Info)
-        .unwrap_or_else(|e| eprintln!("eventlog init failed: {}", e));
+/// Configure logging: per-run file or Windows Event Log
+fn setup_logging(exe_dir: &PathBuf, master: &MasterConfig) {
+    if master.logging.enable {
+        let log_file = exe_dir.join(
+            master.logging.file.clone().unwrap_or_else(|| "session-debug.log".into()),
+        );
+        let config = ConfigBuilder::new()
+            .set_time_offset_to_local().unwrap()
+            .set_time_format_rfc3339()
+            .set_thread_level(LevelFilter::Debug)
+            .set_target_level(LevelFilter::Info)
+            .set_location_level(LevelFilter::Off)
+            .build();
+        WriteLogger::init(
+            LevelFilter::Debug,
+            config,
+            File::create(&log_file).unwrap_or_else(|e| {
+                eprintln!(
+                    "[{}][ERROR][logging][pid={}][tid={:?}] Could not create log file: {}",
+                    Local::now().to_rfc3339(), process::id(), thread::current().id(), e
+                );
+                process::exit(1);
+            }),
+        ).unwrap_or_else(|e| {
+            eprintln!(
+                "[{}][ERROR][logging][pid={}][tid={:?}] Failed to initialize file logger: {}",
+                Local::now().to_rfc3339(), process::id(), thread::current().id(), e
+            );
+            process::exit(1);
+        });
+        gladix_log!(Level::Info, "logging", "Log file: {:?}", log_file);
+    } else {
+        event_init(SERVICE_DISPLAY_NAME, Level::Info)
+            .unwrap_or_else(|e| eprintln!(
+                "[{}][ERROR][logging][pid={}][tid={:?}] Event log init failed: {}",
+                Local::now().to_rfc3339(), process::id(), thread::current().id(), e
+            ));
+    }
+}
 
-    // Channel for shutdown signal
-    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+/// Main service logic
+fn run_service() {
+    // Determine executable directory
+    let exe_dir = std::env::current_exe()
+        .expect("Failed to get exe path")
+        .parent().expect("Executable must reside in a directory").to_path_buf();
 
-    // Register service control handler
+    gladix_log!(Level::Info, "service", "Test message");
+    
+    // Load configuration
+    let config_path = exe_dir.join("default.toml");
+    let master: MasterConfig = load_master_config(&config_path)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "[{}][ERROR][config][pid={}][tid={:?}] Config load failed: {}",
+                Local::now().to_rfc3339(), process::id(), thread::current().id(), e
+            );
+            process::exit(1);
+        });
+
+    // Initialize logging
+    setup_logging(&exe_dir, &master);
+    gladix_log!(Level::Info, "service", "Service starting");
+
+    // Register control handler
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
     let status_handle = service_control_handler::register(
         SERVICE_NAME,
         move |control_event| match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                info!("Stop requested");
+                gladix_log!(Level::Info, "service", "Stop requested");
                 let _ = shutdown_tx.send(());
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         },
-    )
-    .expect("Failed to register service control handler");
+    ).expect("Failed to register service control handler");
 
-    // Report Start Pending
+    // Set service status to StartPending
     let mut status = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::StartPending,
@@ -63,37 +121,22 @@ fn service_main(_args: Vec<OsString>) {
         process_id: None,
     };
     status_handle.set_service_status(status.clone()).unwrap();
-    info!("Service starting");
 
-    // Determine executable directory
-    let exe_dir = std::env::current_exe()
-        .expect("Failed to get exe path")
-        .parent()
-        .expect("Executable must reside in a directory")
-        .to_path_buf();
-
-    // Load configuration
-    let config_path = exe_dir.join("default.toml");
-    let master: MasterConfig = load_master_config(&config_path)
-        .unwrap_or_else(|e| { error!("Failed to load config: {}", e); std::process::exit(1) });
-    info!("Configuration loaded from {:?}", config_path);
-
-    // Prepare scheduled risk groups
+    // Prepare scanning groups
     let groups: Vec<RiskGroup> = [
         (DirectoryRisk::High, master.scanner.high),
         (DirectoryRisk::Medium, master.scanner.medium),
         (DirectoryRisk::Low, master.scanner.low),
         (DirectoryRisk::Special, master.scanner.special),
-    ]
-    .into_iter()
-    .filter_map(|(risk, opt)| opt.map(|cfg| convert_config_to_risk_group(risk, cfg)))
-    .filter(|g| g.scheduled_interval.is_some())
-    .collect();
+    ].into_iter()
+        .filter_map(|(risk, opt)| opt.map(|cfg| convert_config_to_risk_group(risk, cfg)))
+        .filter(|g| g.scheduled_interval.is_some())
+        .collect();
 
-    // Report Running
+    // Set service state to Running
     status.current_state = ServiceState::Running;
     status_handle.set_service_status(status.clone()).unwrap();
-    info!("Service running with {} scheduled group(s)", groups.len());
+    gladix_log!(Level::Info, "service", "Service running with {} group(s)", groups.len());
 
     // Launch scanner thread
     let cache_path = exe_dir.join("persistent_cache.json");
@@ -101,59 +144,26 @@ fn service_main(_args: Vec<OsString>) {
 
     // Wait for stop signal
     let _ = shutdown_rx.recv();
-    info!("Shutdown initiated");
+    gladix_log!(Level::Info, "service", "Shutdown initiated");
 
-    // Report Stopped
+    // Mark service as stopped
     status.current_state = ServiceState::Stopped;
     status_handle.set_service_status(status).unwrap();
-    info!("Service stopped cleanly");
+    gladix_log!(Level::Info, "service", "Service stopped cleanly");
 }
 
+/// Entry point for the Windows Service control dispatcher
+fn service_main(_args: Vec<OsString>) {
+    run_service();
+}
+
+/// Program entry: attempt to run as service; fallback to console
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-
-    // Uninstall command
-    if args.iter().any(|a| a.eq_ignore_ascii_case("uninstall")) {
-        deregister(SERVICE_DISPLAY_NAME)
-            .unwrap_or_else(|e| eprintln!("Event source deregister failed: {}", e));
-        let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .expect("Failed to connect to SCM");
-        let svc = mgr.open_service(
-            OsString::from(SERVICE_NAME),
-            ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
-        ).expect("Failed to open service");
-        svc.delete().expect("Failed to delete service");
-        info!("Service uninstalled: {}", SERVICE_DISPLAY_NAME);
-        println!("{} uninstalled successfully.", SERVICE_DISPLAY_NAME);
-        return;
+    if let Err(e) = start(SERVICE_NAME, ffi_service_main) {
+        eprintln!(
+            "[{}][ERROR][main][pid={}][tid={:?}] Not a service: {}. Running in console mode.",
+            Local::now().to_rfc3339(), process::id(), thread::current().id(), e
+        );
+        run_service();
     }
-
-    // Install command
-    if args.iter().any(|a| a.eq_ignore_ascii_case("install")) {
-        register(SERVICE_DISPLAY_NAME)
-            .unwrap_or_else(|e| eprintln!("Event source register failed: {}", e));
-        let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-            .expect("Failed to connect to SCM");
-        let exe_path = std::env::current_exe().expect("Failed to get exe path");
-        let service_info = ServiceInfo {
-            name: OsString::from(SERVICE_NAME),
-            display_name: OsString::from(SERVICE_DISPLAY_NAME),
-            service_type: ServiceType::OWN_PROCESS,
-            start_type: ServiceStartType::AutoStart,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: exe_path,
-            launch_arguments: vec![],
-            dependencies: vec![],
-            account_name: None,
-            account_password: None,
-        };
-        mgr.create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
-            .expect("Failed to create service");
-        info!("Service installed: {}", SERVICE_DISPLAY_NAME);
-        println!("{} installed successfully.", SERVICE_DISPLAY_NAME);
-        return;
-    }
-
-    // Run as a Windows service
-    start(SERVICE_NAME, ffi_service_main).expect("Failed to start service dispatcher");
 }

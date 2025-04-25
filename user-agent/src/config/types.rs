@@ -27,6 +27,27 @@ use std::path::PathBuf;
 use std::time::Duration;
 use serde::Deserialize;
 
+
+#[derive(Debug, Deserialize)]
+pub struct LoggingConfig {
+    /// Enable per‐run debug logging
+    #[serde(default)]
+    pub enable: bool,
+    /// Where to write the log file (relative to exe dir)
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        LoggingConfig {
+            enable: false,
+            file: None,
+        }
+    }
+}
+
+
 /// Risk levels for directory groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum DirectoryRisk {
@@ -66,4 +87,6 @@ pub struct ScannerConfig {
 #[derive(Debug, Deserialize)]
 pub struct MasterConfig {
     pub scanner: ScannerConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
