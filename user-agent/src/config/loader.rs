@@ -1,42 +1,55 @@
-//! Configuration file loader and converter.
+//! # Configuration Loader
 //!
-//! This module handles loading and parsing of the main configuration file
-//! (typically in TOML format). It transforms file-based structures into
-//! runtime-ready formats with `PathBuf` and `Duration` types.
+//! Responsible for loading and parsing the master TOML config, and
+//! converting raw risk‐group definitions into runtime scanner groups.
 //!
-//! Key responsibilities:
-//! - Load and deserialize the master configuration from disk.
-//! - Convert risk group definitions from raw config to executable form.
-//! - Handle validation and format conversions safely.
-//! - Provide a clean API to initialize scanning groups.
+//! **Responsibilities:**
+//! - Read `default.toml` from disk.
+//! - Deserialize into `MasterConfig`.
+//! - Convert each `RiskGroupConfig` into a `RiskGroup` with `PathBuf`+`Duration`.
 
+use crate::gladix_log;
+use log::Level;
+use crate::config::types::{MasterConfig, DirectoryRisk, RiskGroupConfig, RiskGroup};
+use std::{fs, path::Path, path::PathBuf, time::Duration};
 
-use crate::config::types::{
-    MasterConfig,
-    DirectoryRisk,
-    RiskGroupConfig,
-    RiskGroup,
-};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-
-/// Lee el TOML de disco y lo deserializa.
+/// Load and parse the master configuration from `path`.
+///
+/// Logs at DEBUG when starting and INFO on success, or bubbles errors.
 pub fn load_master_config(path: &Path) -> Result<MasterConfig, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&txt)?)
+    gladix_log!(Level::Debug, "Reading config from {:?}", path);
+    let txt = fs::read_to_string(path)?;
+    let cfg: MasterConfig = toml::from_str(&txt)?;
+    gladix_log!(Level::Info, "Loaded config from {:?}", path);
+    Ok(cfg)
 }
 
-/// Convierte un bloque RiskGroupConfig en el objeto de runtime.
-pub fn convert_config_to_risk_group(risk: DirectoryRisk, cfg: RiskGroupConfig) -> RiskGroup {
+/// Convert a single `RiskGroupConfig` into a runtime `RiskGroup`.
+///
+/// Logs at DEBUG with the number of dirs and the scan interval.
+pub fn convert_config_to_risk_group(
+    risk: DirectoryRisk,
+    cfg: RiskGroupConfig,
+) -> RiskGroup {
+    // Build PathBuf list and Duration
+    let dirs: Vec<PathBuf> = cfg
+        .directories
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let interval = cfg.scheduled_interval.map(Duration::from_secs);
+
+    gladix_log!(
+        Level::Debug,
+        "Converted {:?} group: {} dirs, interval={:?}",
+        risk,
+        dirs.len(),
+        interval
+    );
+
     RiskGroup {
         risk,
-        directories: cfg.directories
-            .into_iter()
-            .map(PathBuf::from)
-            .collect(),
-        scheduled_interval: cfg
-            .scheduled_interval
-            .map(Duration::from_secs),
+        directories: dirs,
+        scheduled_interval: interval,
     }
 }
