@@ -9,7 +9,6 @@
 //! - Detect executable files by extension.
 
 use crate::gladix_log;
-use log::Level;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;

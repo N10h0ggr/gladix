@@ -1,21 +1,16 @@
+// src/config/loader.rs
+
 //! # Configuration Loader
 //!
-//! Responsible for loading and parsing the master TOML config, and
-//! converting raw risk‐group definitions into runtime scanner groups.
-//!
-//! **Responsibilities:**
-//! - Read `default.toml` from disk.
-//! - Deserialize into `MasterConfig`.
-//! - Convert each `RiskGroupConfig` into a `RiskGroup` with `PathBuf`+`Duration`.
+//! Reads `default.toml`, deserializes into `MasterConfig`, and
+//! converts raw risk‐group configs into runtime `RiskGroup`s.
 
 use crate::gladix_log;
-use log::Level;
 use crate::config::types::{MasterConfig, DirectoryRisk, RiskGroupConfig, RiskGroup};
 use std::{fs, path::Path, path::PathBuf, time::Duration};
 
 /// Load and parse the master configuration from `path`.
-///
-/// Logs at DEBUG when starting and INFO on success, or bubbles errors.
+/// Logs at DEBUG before reading and INFO on success.
 pub fn load_master_config(path: &Path) -> Result<MasterConfig, Box<dyn std::error::Error>> {
     gladix_log!(Level::Debug, "Reading config from {:?}", path);
     let txt = fs::read_to_string(path)?;
@@ -24,21 +19,18 @@ pub fn load_master_config(path: &Path) -> Result<MasterConfig, Box<dyn std::erro
     Ok(cfg)
 }
 
-/// Convert a single `RiskGroupConfig` into a runtime `RiskGroup`.
-///
-/// Logs at DEBUG with the number of dirs and the scan interval.
+/// Convert one `RiskGroupConfig` into a runtime `RiskGroup`.
+/// Logs at DEBUG with directory count and interval.
 pub fn convert_config_to_risk_group(
     risk: DirectoryRisk,
     cfg: RiskGroupConfig,
 ) -> RiskGroup {
-    // Build PathBuf list and Duration
     let dirs: Vec<PathBuf> = cfg
         .directories
         .into_iter()
         .map(PathBuf::from)
         .collect();
     let interval = cfg.scheduled_interval.map(Duration::from_secs);
-
     gladix_log!(
         Level::Debug,
         "Converted {:?} group: {} dirs, interval={:?}",
@@ -46,7 +38,6 @@ pub fn convert_config_to_risk_group(
         dirs.len(),
         interval
     );
-
     RiskGroup {
         risk,
         directories: dirs,

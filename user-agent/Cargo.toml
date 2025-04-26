@@ -19,7 +19,6 @@ shared = { path = "../shared" }
 log             = "0.4"
 simplelog      = "0.12"
 windows-service = "0.8.0"
-
-[target.'cfg(windows)'.dependencies]
 eventlog       = "0.3.0"
+
 

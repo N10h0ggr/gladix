@@ -1,159 +1,116 @@
-//! Windows service + console entrypoint for the Gladix User Agent.
+// src/main.rs
+
+//! Agent entrypoint: Windows-service or console fallback.
 
 #[macro_use]
 mod macros;
-mod scanner;
 mod config;
+mod scanner;
 mod comms;
 
 use chrono::Local;
-use log::{Level, LevelFilter};
+use log::LevelFilter;
 use simplelog::{CombinedLogger, TermLogger, WriteLogger, ConfigBuilder, TerminalMode, ColorChoice};
 use std::{ffi::OsString, fs::File, path::PathBuf, process, sync::mpsc, thread, time::Duration};
-
-#[cfg(windows)]
 use windows_service::{
     define_windows_service,
     service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType},
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher::start,
 };
-#[cfg(windows)]
-use eventlog::init as event_init;
 
-// No-op stubs so we still build on non-Windows:
-#[cfg(not(windows))]
-macro_rules! define_windows_service { ($($t:tt)*) => {} }
-#[cfg(not(windows))]
-fn start(_name: &str, _f: fn(Vec<OsString>)) -> Result<(), ()> { Ok(()) }
-#[cfg(not(windows))]
-fn event_init(_disp: &str, _lvl: log::Level) -> Result<(), ()> { Ok(()) }
 
 use crate::config::{load_master_config, convert_config_to_risk_group};
 use crate::config::types::{MasterConfig, RiskGroup, DirectoryRisk};
 use crate::scanner::run_scanner;
 
 const SERVICE_NAME: &str = "Gladix";
-const SERVICE_DISPLAY_NAME: &str = "Gladix User Agent Service";
 
 define_windows_service!(ffi_service_main, service_main);
 
-/// Set up our combined logger: always stdout + optional file.
+
 fn setup_logging(exe_dir: &PathBuf, master: &MasterConfig) {
-    // 1) Parse the level string into LevelFilter
+    // 1) Read desired level from config
     let level = match master.logging.level.to_uppercase().as_str() {
-        "OFF" => LevelFilter::Off,
         "ERROR" => LevelFilter::Error,
-        "WARN" | "WARNING" => LevelFilter::Warn,
+        "WARN"  => LevelFilter::Warn,
         "DEBUG" => LevelFilter::Debug,
         "TRACE" => LevelFilter::Trace,
-        _ => LevelFilter::Info,
+        "OFF"   => LevelFilter::Off,
+        _       => LevelFilter::Info,
     };
 
-    // 2) Determine the log file path
-    let log_file = exe_dir.join(
-        master.logging.file.clone().unwrap_or_else(|| "agent.log".into()),
-    );
+    // 2) Turn off all of simplelog’s own stamping (time/level/target/thread/location)
+    let config = ConfigBuilder::new()
+        .set_max_level(LevelFilter::Off)        // no simplelog [LEVEL]
+        .set_time_format_rfc3339()              // RFC3339 if we did use it
+        .set_time_level(LevelFilter::Off)
+        .set_thread_level(LevelFilter::Off)
+        .set_target_level(LevelFilter::Off)
+        .set_location_level(LevelFilter::Off)
+        .build();
 
-    // 3) Build logger collection
-    let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = Vec::new();
+    // 3) Always log to console
+    let mut backends: Vec<Box<dyn simplelog::SharedLogger>> = vec![
+        TermLogger::new(level, config.clone(), TerminalMode::Mixed, ColorChoice::Never),
+    ];
 
-    // Always log to stdout (no ANSI colors)
-    loggers.push(TermLogger::new(
-        level,
-        ConfigBuilder::new()
-            .set_time_format_rfc3339()
-            .build(),
-        TerminalMode::Mixed,
-        ColorChoice::Never,
-    ));
-
-    // If enabled, also write to a file (overwriting on each run)
+    // 4) Optionally also to a file
     if master.logging.enable {
-        let f = File::create(&log_file).unwrap_or_else(|e| {
-            eprintln!(
-                "[{}][ERROR][logging][pid={}][tid={:?}] Could not open {}: {}",
-                Local::now().to_rfc3339(),
-                process::id(),
-                thread::current().id(),
-                log_file.display(),
-                e
-            );
+        let log_path = exe_dir.join(master.logging.file.clone().unwrap_or_else(|| "agent.log".into()));
+        let f = File::create(&log_path).unwrap_or_else(|e| {
+            eprintln!("[{}][ERROR][logging] Could not open {}: {}", Local::now().to_rfc3339(), log_path.display(), e);
             process::exit(1);
         });
-        loggers.push(WriteLogger::new(
-            level,
-            ConfigBuilder::new()
-                .set_time_format_rfc3339()
-                .build(),
-            f,
-        ));
+        backends.push(WriteLogger::new(level, config, f));
     }
 
-    // 4) Initialize the CombinedLogger
-    CombinedLogger::init(loggers).unwrap_or_else(|e| {
-        eprintln!(
-            "[{}][ERROR][logging][pid={}][tid={:?}] Logger setup failed: {}",
-            Local::now().to_rfc3339(),
-            process::id(),
-            thread::current().id(),
-            e
-        );
+    CombinedLogger::init(backends).unwrap_or_else(|e| {
+        eprintln!("[{}][ERROR][logging] Logger init failed: {}", Local::now().to_rfc3339(), e);
         process::exit(1);
     });
 
-    // 5) Kick off with an INFO so we know logging’s alive
-    gladix_log!(
-        Level::Info,
-        "Logging initialized (level={:?}, file={})",
-        level,
-        log_file.display()
-    );
+    // Our kick‐off message
+    gladix_log!(Level::Info, "Logging initialized (level={:?})", level);
 }
 
-/// The core service (or console) workflow
+
 fn run_service() {
-    // Find the executable directory
+    // Locate the executable directory for config and cache files
     let exe_dir = std::env::current_exe()
-        .expect("Failed to get exe path")
+        .unwrap()
         .parent()
-        .expect("Exe must be in a directory")
+        .unwrap()
         .to_path_buf();
 
-    // Load default.toml
-    let config_path = exe_dir.join("default.toml");
-    let master: MasterConfig = load_master_config(&config_path).unwrap_or_else(|e| {
+    // Load and validate the master configuration file (default.toml)
+    let master: MasterConfig = load_master_config(&exe_dir.join("default.toml")).unwrap_or_else(|e| {
         eprintln!(
-            "[{}][ERROR][config][pid={}][tid={:?}] Config load failed: {}",
+            "[{}][ERROR][config] Config load failed: {}",
             Local::now().to_rfc3339(),
-            process::id(),
-            thread::current().id(),
             e
         );
         process::exit(1);
     });
 
-    // Initialize logging
     setup_logging(&exe_dir, &master);
-    gladix_log!(Level::Info, "Service starting");
+    gladix_log!(log::Level::Info, "Service starting");
 
-    // Register Ctrl handler for Stop/Shutdown
+    // Use a sync channel with capacity=1 to signal a single shutdown event
     let (tx, rx) = mpsc::sync_channel(1);
-    let status_handle = service_control_handler::register(
-        SERVICE_NAME,
-        move |evt| match evt {
-            ServiceControl::Stop | ServiceControl::Shutdown => {
-                gladix_log!(Level::Warn, "Stop requested");
-                let _ = tx.send(());
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
-        },
-    )
-        .expect("Failed to register service control handler");
 
-    // Report StartPending → Running
+    // Register handler for Windows service control events (Stop/Shutdown)
+    let status_handle = service_control_handler::register(SERVICE_NAME, move |control| match control {
+        ServiceControl::Stop | ServiceControl::Shutdown => {
+            // Notify the main thread to begin clean shutdown
+            gladix_log!(log::Level::Warn, "Stop requested");
+            let _ = tx.send(());
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        _ => ServiceControlHandlerResult::NotImplemented,
+    }).unwrap();
+
     let mut status = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::StartPending,
@@ -163,52 +120,54 @@ fn run_service() {
         wait_hint: Duration::from_secs(30),
         process_id: None,
     };
+
     status_handle.set_service_status(status.clone()).unwrap();
 
-    // Build scanner groups from config
-    let groups: Vec<RiskGroup> = [
-        (DirectoryRisk::High, master.scanner.high),
+    // Build only those risk groups that have a scheduled scan interval
+    // This avoids spawning scanner threads for disabled groups
+    let groups: Vec<RiskGroup> = vec![
+        (DirectoryRisk::High,   master.scanner.high),
         (DirectoryRisk::Medium, master.scanner.medium),
-        (DirectoryRisk::Low, master.scanner.low),
-        (DirectoryRisk::Special, master.scanner.special),
+        (DirectoryRisk::Low,    master.scanner.low),
+        (DirectoryRisk::Special,master.scanner.special),
     ]
         .into_iter()
-        .filter_map(|(risk, opt)| opt.map(|c| convert_config_to_risk_group(risk, c)))
-        .filter(|g| g.scheduled_interval.is_some())
+        .filter_map(|(risk, opt_config)| {
+            // Convert only configured entries into RiskGroup instances
+            opt_config.map(|cfg| convert_config_to_risk_group(risk, cfg))
+        })
+        .filter(|group| group.scheduled_interval.is_some())
         .collect();
 
-    // Now running
     status.current_state = ServiceState::Running;
     status_handle.set_service_status(status.clone()).unwrap();
-    gladix_log!(Level::Info, "Service running with {} group(s)", groups.len());
+    gladix_log!(log::Level::Info, "Service running with {} group(s)", groups.len());
 
-    // Spawn scanner thread
-    let cache = exe_dir.join("persistent_cache.json");
-    thread::spawn(move || run_scanner(groups, cache));
+    let cache_path = exe_dir.join("persistent_cache.json");
 
-    // Block until Stop/Shutdown
+    // Run the scanner on a background thread so the service control loop stays responsive
+    thread::spawn(move || run_scanner(groups, cache_path));
+
+    // Block until a shutdown signal is received
     let _ = rx.recv();
-    gladix_log!(Level::Warn, "Shutdown initiated");
+    gladix_log!(log::Level::Warn, "Shutdown initiated");
 
-    // Mark Stopped
     status.current_state = ServiceState::Stopped;
     status_handle.set_service_status(status).unwrap();
-    gladix_log!(Level::Info, "Service stopped cleanly");
+    gladix_log!(log::Level::Info, "Service stopped cleanly");
 }
 
-/// Called by the Windows service dispatcher
 fn service_main(_args: Vec<OsString>) {
     run_service();
 }
 
-/// Entry point: service mode or console fallback
 fn main() {
-    if let Err(_) = start(SERVICE_NAME, ffi_service_main) {
+    // Attempt to run as a Windows service; fallback to console if not running under SCM
+    if let Err(e) = start(SERVICE_NAME, ffi_service_main) {
         eprintln!(
-            "[{}][ERROR][main][pid={}][tid={:?}] Not a service, running console",
+            "[{}][ERROR][main] Not a service: {}. Running as console.",
             Local::now().to_rfc3339(),
-            process::id(),
-            thread::current().id()
+            e
         );
         run_service();
     }

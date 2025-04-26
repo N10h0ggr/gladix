@@ -1,41 +1,29 @@
-//! Configuration structures and risk-level definitions.
-//!
-//! This module defines all configuration data structures used at both
-//! deserialization and runtime stages of the agent. It distinguishes between
-//! raw config formats (from TOML) and internal representations used during
-//! execution.
-//!
-//! Key responsibilities:
-//! - Define risk levels (`DirectoryRisk`) for directory groups.
-//! - Represent runtime scan groups (`RiskGroup`).
-//! - Define TOML-deserialized structures (`ScannerConfig`, `MasterConfig`, etc.).
-//! - Keep a clean separation between config file format and logic-layer usage.
-//! Configuration structures and risk-level definitions.
-//!
-//! This module defines all configuration data structures used at both
-//! deserialization and runtime stages of the agent. It distinguishes between
-//! raw config formats (from TOML) and internal representations used during
-//! execution.
-//!
-//! Key responsibilities:
-//! - Define risk levels (`DirectoryRisk`) for directory groups.
-//! - Represent runtime scan groups (`RiskGroup`).
-//! - Define TOML-deserialized structures (`ScannerConfig`, `MasterConfig`, etc.).
-//! - Keep a clean separation between config file format and logic-layer usage.
+// src/config/types.rs
 
+//! Configuration structures and risk‐level definitions.
+
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
-use serde::Deserialize;
 
-
+/// Per‐run logging settings.
 #[derive(Debug, Deserialize)]
 pub struct LoggingConfig {
-    /// Enable per‐run debug logging
+    /// If true, write a session log file in addition to stdout.
     #[serde(default)]
     pub enable: bool,
-    /// Where to write the log file (relative to exe dir)
+
+    /// Relative path under the exe dir for the log file.
     #[serde(default)]
     pub file: Option<String>,
+
+    /// Log level: "ERROR", "WARN", "INFO", "DEBUG", or "TRACE"
+    #[serde(default = "default_level")]
+    pub level: String,
+}
+
+fn default_level() -> String {
+    "INFO".into()
 }
 
 impl Default for LoggingConfig {
@@ -43,12 +31,18 @@ impl Default for LoggingConfig {
         LoggingConfig {
             enable: false,
             file: None,
+            level: default_level(),
         }
     }
 }
 
+/// Holds all scanner group settings.
+#[derive(Debug, Deserialize)]
+pub struct RiskGroupConfig {
+    pub directories: Vec<String>,
+    pub scheduled_interval: Option<u64>,
+}
 
-/// Risk levels for directory groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum DirectoryRisk {
     Low,
@@ -57,16 +51,6 @@ pub enum DirectoryRisk {
     Special,
 }
 
-/// Raw TOML block for each risk group.
-#[derive(Debug, Deserialize)]
-pub struct RiskGroupConfig {
-    /// Paths (as strings) to scan under this risk level
-    pub directories: Vec<String>,
-    /// Optional interval (in seconds) between scans
-    pub scheduled_interval: Option<u64>,
-}
-
-/// Runtime representation of a group to scan.
 #[derive(Debug)]
 pub struct RiskGroup {
     pub risk: DirectoryRisk,
@@ -74,19 +58,31 @@ pub struct RiskGroup {
     pub scheduled_interval: Option<Duration>,
 }
 
-/// Scanner section of your master config.
 #[derive(Debug, Deserialize)]
 pub struct ScannerConfig {
     pub low: Option<RiskGroupConfig>,
     pub medium: Option<RiskGroupConfig>,
     pub high: Option<RiskGroupConfig>,
-    pub special: Option<RiskGroupConfig>, // <-- Add this
+    pub special: Option<RiskGroupConfig>,
 }
 
-/// Top‐level config as deserialized from TOML.
 #[derive(Debug, Deserialize)]
 pub struct MasterConfig {
     pub scanner: ScannerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+impl Default for MasterConfig {
+    fn default() -> Self {
+        MasterConfig {
+            scanner: ScannerConfig {
+                low: None,
+                medium: None,
+                high: None,
+                special: None,
+            },
+            logging: LoggingConfig::default(),
+        }
+    }
 }

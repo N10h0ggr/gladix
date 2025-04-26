@@ -1,50 +1,24 @@
+// src/scanner/events.rs
+
 //! Unified event model used across the agent.
 //!
-//! This module defines the `Event` enum and associated data structures
-//! representing telemetry from all sources: filesystem, network, process
-//! creation, scan results, and ETW events.
-//!
-//! Each event can be serialized to JSON (for logging or persistence)
-//! and to Protobuf (for gRPC/IPC communication), and is compatible with the
-//! definitions in the shared `event.proto` schema.
-//!
-//! ## Purpose
-//! These types are used to:
-//! - Normalize incoming data into a central pipeline
-//! - Persist events to SQLite
-//! - Trigger detection logic
-//! - Render in the UI or export externally
-//!
-//! ## Formats Supported
-//! - `serde` for JSON serialization
-//! - `prost` for Protobuf compatibility
-//!
-//! ## Extension
-//! To add new telemetry types, simply:
-//! 1. Add a new variant to `Event`
-//! 2. Define a new struct with `Serialize`, `Deserialize`
-//! 3. Update the `.proto` schema and implement conversion logic
+//! Defines the `Event` enum and data structures for filesystem, network,
+//! process creation, scan results, and ETW telemetry.
+//! Supports JSON (serde) and Protobuf (prost) serialization compatible with `event.proto`.
 
-
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use anyhow::{anyhow, Error as AnyhowError};
-use chrono::{DateTime, Utc, NaiveDateTime};
-use core::error::Error;
+use chrono::{DateTime, Utc};
 use shared::events::base_event::Payload;
 
 use shared::events::{
     BaseEvent as ProtoEvent,
     FileEvent as ProtoFileEvent,
-    base_event,
     file_event,
 };
 
-/// Unified telemetry event type used across the system.
-///
-/// Each variant corresponds to a different sensor (filesystem, network, process, scan, ETW),
-/// and wraps a specific structured payload. This enum enables consistent processing,
-/// storage, filtering, and detection across the pipeline.
+/// Core enum representing all telemetry types in a normalized form.
+/// Allows pipeline stages (storage, filtering, detection) to work generically.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", content = "payload")]
 pub enum Event {
@@ -55,14 +29,7 @@ pub enum Event {
     Etw(EtwEvent),
 }
 
-/// Represents a file system operation intercepted by the kernel minifilter.
-///
-/// This includes actions like creation, writing, deletion, or renaming of files,
-/// along with metadata about the process responsible, the file path, and
-/// the hash of the content if available.
-///
-/// These events are often the first signal in execution chains such as
-/// droppers, installers, or ransomware attempts.
+/// File system operations like create, write, delete, rename.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEvent {
     pub ts: DateTime<Utc>,
@@ -80,11 +47,7 @@ pub struct FileEvent {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum FileOperation { Create, Write, Delete, Rename }
 
-/// Captures outbound or inbound network flow telemetry as seen by the WFP sensor.
-///
-/// Includes source/destination addresses and ports, process metadata, and byte counts.
-/// These events are useful to detect C2 beacons, data exfiltration, or suspicious traffic
-/// to rare destinations.
+/// Network flow events for C2, exfiltration detection.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NetworkEvent {
     pub ts: DateTime<Utc>,
@@ -104,10 +67,7 @@ pub struct NetworkEvent {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Direction { Inbound, Outbound }
 
-/// Represents the creation of a new process, captured via ETW or kernel callbacks.
-///
-/// Includes process ID, parent process ID, the executable image, and full command line.
-/// Useful for detecting suspicious process chains, LOLBins, or execution anomalies.
+/// Process creation events for detecting anomalous chains.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProcessEvent {
     pub ts: DateTime<Utc>,
@@ -118,10 +78,7 @@ pub struct ProcessEvent {
     pub cmdline: String,
 }
 
-/// Result of scanning a file using embedded detection rules (e.g. YARA).
-///
-/// Includes the triggered rule ID, list of matches, file path, and an associated severity level.
-/// This is a detection-level event that may trigger alerts or automated responses.
+/// Output of embedded scanner (e.g. YARA), triggers alerts.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScanResult {
     pub ts: DateTime<Utc>,
@@ -135,11 +92,7 @@ pub struct ScanResult {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Severity { Low, Medium, High, Critical }
 
-/// Raw system telemetry received from ETW (Event Tracing for Windows).
-///
-/// This is a generic wrapper that supports multiple provider types, preserving
-/// the original payload in JSON form for flexible downstream parsing.
-/// Examples include module loads, registry changes, or service activity.
+/// Generic ETW wrapper preserving raw JSON payload.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EtwEvent {
     pub ts: DateTime<Utc>,
@@ -152,25 +105,14 @@ pub struct EtwEvent {
     pub json_payload: String,
 }
 
-/// Converts a unified `Event` enum into a `ProtoEvent` (Protobuf-compatible format).
-///
-/// This is used to send events across gRPC or IPC boundaries by transforming the
-/// internal Rust representation into the serialized wire format defined in `event.proto`.
-///
-/// Each variant of the `Event` enum is mapped to the corresponding `oneof` payload
-/// inside the `BaseEvent` Protobuf message.
-///
-/// # Used By
-/// - gRPC endpoint responses
-/// - Kernel-to-user IPC forwarding
-/// - Logging to remote systems
-
-impl Into<ProtoEvent> for Event {
-    fn into(self) -> ProtoEvent {
-        match self {
+/// Convert internal `Event` to Protobuf `ProtoEvent` for gRPC/IPC.
+/// Only `File` variant shown; other variants require similar mapping.
+impl From<Event> for ProtoEvent {
+    fn from(evt: Event) -> ProtoEvent {
+        match evt {
             Event::File(fe) => {
                 let mut base = ProtoEvent::default();
-                // timestamp
+                // Convert chrono timestamp to prost Timestamp
                 let ts_proto = prost_types::Timestamp {
                     seconds: fe.ts.timestamp(),
                     nanos: fe.ts.timestamp_subsec_nanos() as i32,
@@ -178,7 +120,7 @@ impl Into<ProtoEvent> for Event {
                 base.ts = Some(ts_proto);
                 base.sensor_guid = fe.sensor_guid.clone();
 
-                // map operation to prost enum
+                // Map Rust enum into Prost enum values
                 let op_enum = match fe.op {
                     FileOperation::Create => file_event::Operation::Create,
                     FileOperation::Write => file_event::Operation::Write,
@@ -186,7 +128,6 @@ impl Into<ProtoEvent> for Event {
                     FileOperation::Rename => file_event::Operation::Rename,
                 } as i32;
 
-                // set payload
                 base.payload = Some(Payload::FileEvent(ProtoFileEvent {
                     op: op_enum,
                     path: fe.path,
@@ -199,64 +140,46 @@ impl Into<ProtoEvent> for Event {
                 }));
                 base
             }
-            _ => unimplemented!(),
+            _ => unimplemented!("Other Event variants not yet implemented"),
         }
     }
 }
 
-/// Attempts to parse a Protobuf `ProtoEvent` into the internal `Event` enum.
-///
-/// This conversion is fallible to handle edge cases such as:
-/// - Missing required fields (e.g., timestamp)
-/// - Invalid or unsupported payloads
-/// - Legacy or corrupted messages
-///
-/// This is primarily used when receiving data over gRPC, loading from disk,
-/// or parsing incoming telemetry from lower layers.
-///
-/// # Errors
-/// Returns an error if the timestamp is missing or the payload cannot be parsed.
-
+/// Parse Protobuf `ProtoEvent` back into internal `Event`, verifying required fields.
 impl TryFrom<ProtoEvent> for Event {
     type Error = AnyhowError;
 
     fn try_from(pe: ProtoEvent) -> Result<Self, Self::Error> {
-        // timestamp conversion
+        // Ensure timestamp present and valid
         let ts_proto = pe.ts.ok_or_else(|| anyhow!("missing timestamp"))?;
-        let naive = NaiveDateTime::from_timestamp_opt(ts_proto.seconds, ts_proto.nanos as u32)
-            .ok_or_else(|| anyhow!("invalid timestamp"))?;
-        let ts = DateTime::<Utc>::from_utc(naive, Utc);
+        let ts = DateTime::from_timestamp(ts_proto.seconds, ts_proto.nanos as u32).expect("invalid timestamp");
         let sensor = pe.sensor_guid;
 
-        if let Some(payload) = pe.payload {
-            match payload {
-                Payload::FileEvent(f) => {
-                    // map prost enum back to local
-                    let proto_op = file_event::Operation::from_i32(f.op)
-                        .ok_or_else(|| anyhow!("invalid operation"))?;
-                    let op = match proto_op {
-                        file_event::Operation::Create => FileOperation::Create,
-                        file_event::Operation::Write => FileOperation::Write,
-                        file_event::Operation::Delete => FileOperation::Delete,
-                        file_event::Operation::Rename => FileOperation::Rename,
-                    };
-                    Ok(Event::File(FileEvent {
-                        ts,
-                        sensor_guid: sensor,
-                        op,
-                        path: f.path,
-                        new_path: if f.new_path.is_empty() { None } else { Some(f.new_path) },
-                        pid: f.pid,
-                        exe_path: f.exe_path,
-                        size: f.size,
-                        sha256: f.sha256,
-                        success: f.success,
-                    }))
-                }
-                _ => Err(anyhow!("unsupported payload type")),
+        match pe.payload.ok_or_else(|| anyhow!("no payload"))? {
+            Payload::FileEvent(f) => {
+                // TryFrom ensures only valid enum values accepted
+                let proto_op = file_event::Operation::try_from(f.op)
+                    .map_err(|_| anyhow!("invalid file operation {}", f.op))?;
+                let op = match proto_op {
+                    file_event::Operation::Create => FileOperation::Create,
+                    file_event::Operation::Write => FileOperation::Write,
+                    file_event::Operation::Delete => FileOperation::Delete,
+                    file_event::Operation::Rename => FileOperation::Rename,
+                };
+                Ok(Event::File(FileEvent {
+                    ts,
+                    sensor_guid: sensor,
+                    op,
+                    path: f.path,
+                    new_path: if f.new_path.is_empty() { None } else { Some(f.new_path) },
+                    pid: f.pid,
+                    exe_path: f.exe_path,
+                    size: f.size,
+                    sha256: f.sha256,
+                    success: f.success,
+                }))
             }
-        } else {
-            Err(anyhow!("no payload"))
+            other => Err(anyhow!("unsupported payload type: {:?}", other)),
         }
     }
 }
