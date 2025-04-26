@@ -20,9 +20,6 @@ directories = ["C:\\Users\\Noel\\SpecialDir"]
 
 
 [logging]
-# turn on the session‐only debug log
 enable = true
-
-# optional path (relative to the exe dir) for the log file
-# if omitted, defaults to "session-debug.log"
-file = "session-debug.log"
+file = "logs/agent.log"
+level = "DEBUG"
