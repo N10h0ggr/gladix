@@ -17,12 +17,10 @@ prost-types = "0.13.5"
 anyhow = "1.0"
 shared = { path = "../shared" }
 log             = "0.4"
-simplelog      = "0.12"
 windows-service = "0.8.0"
-eventlog       = "0.3.0"
 tokio = "1.44.2"
-time = "0.3.41"
-thiserror = "1.0.69"
+thiserror = "2.0.12"
 rusqlite = { version = "0.35", features = ["unlock_notify", "bundled"] }
-
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
 

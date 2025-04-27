@@ -7,15 +7,12 @@
 //! 3. Register with the SCM (or run as a console fallback)
 //! 4. Launch the directory scanner in a blocking thread
 //! 5. Wait for Stop / Shutdown, then exit cleanly
-//!
-//!
-// ───── project modules ──────────────────────────────────────────────────────
+
 mod comms;
 mod config;
 mod db;
 mod scanner;
 
-// ───── std / 3rd-party imports ──────────────────────────────────────────────
 use chrono::Local;
 use fern::Dispatch;
 use log::LevelFilter;
@@ -40,26 +37,22 @@ use windows_service::{
     service_dispatcher::start,
 };
 
-// ───── local imports ────────────────────────────────────────────────────────
-use crate::comms::events::{EtwEvent, FileEvent, NetworkEvent};
-use crate::config::{convert_config_to_risk_group, load_master_config};
-use crate::config::types::{DirectoryRisk, MasterConfig, RiskGroup};
-use crate::db::db_writer::{BatchInsert, DbWriter};
-use crate::scanner::run_scanner;
+use config::{convert_config_to_risk_group, load_master_config};
+use config::types::{DirectoryRisk, MasterConfig, RiskGroup};
+use comms::events::{EtwEvent, FileEvent, NetworkEvent};
+use db::db_writer::{BatchInsert, DbWriter};
+use metrics_exporter_prometheus::PrometheusBuilder;
+use scanner::run_scanner;
 
-// ───── service constants ────────────────────────────────────────────────────
 const SERVICE_NAME: &str = "Gladix";
 
 define_windows_service!(ffi_service_main, service_main);
 
-// ───── helpers ──────────────────────────────────────────────────────────────
-
-/// Print an error with context and terminate the process.
 macro_rules! fatal {
     ($ctx:expr, $($arg:tt)+) => {{
         eprintln!(
             "[{}][ERROR][{}] {}",
-            chrono::Local::now().to_rfc3339(),
+            Local::now().to_rfc3339(),
             $ctx,
             format!($($arg)+)
         );
@@ -67,7 +60,6 @@ macro_rules! fatal {
     }};
 }
 
-/// Directory that contains the running executable.
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .expect("Cannot determine exe path")
@@ -76,13 +68,11 @@ fn exe_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Load `default.toml` next to the executable.
 fn load_master_cfg(exe_dir: &Path) -> MasterConfig {
     load_master_config(&exe_dir.join("default.toml"))
         .unwrap_or_else(|e| fatal!("config", "{}", e))
 }
 
-/// Open a SQLite database in WAL mode with NORMAL sync.
 fn open_db_connection(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", &"WAL")?;
@@ -90,7 +80,6 @@ fn open_db_connection(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Initialise the main database and apply the schema if it is the first run.
 fn init_database(db_path: &Path) -> rusqlite::Result<Connection> {
     let first_run = !db_path.exists();
     let conn = open_db_connection(db_path)?;
@@ -103,29 +92,26 @@ fn init_database(db_path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-
-/// Configure global logging as requested in `master.logging`.
 fn setup_logging(exe_dir: &Path, master: &MasterConfig) -> Result<(), fern::InitError> {
     let level = match master.logging.level.to_uppercase().as_str() {
         "ERROR" => LevelFilter::Error,
-        "WARN" => LevelFilter::Warn,
+        "WARN"  => LevelFilter::Warn,
         "DEBUG" => LevelFilter::Debug,
         "TRACE" => LevelFilter::Trace,
-        _ => LevelFilter::Info,
+        _       => LevelFilter::Info,
     };
-    
     let log_path = master
         .logging
         .enable
         .then(|| exe_dir.join(master.logging.file.as_deref().unwrap_or("agent.log")));
-    
+
     let mut dispatch = Dispatch::new()
         .format(|out, msg, record| {
             out.finish(format_args!(
                 "[{}][{:5}][{}][pid={}][tid={:?}] {}",
                 Local::now().to_rfc3339(),
                 record.level(),
-                record.target(), // Only print the target (module path)
+                record.target(),
                 process::id(),
                 thread::current().id(),
                 msg
@@ -133,17 +119,15 @@ fn setup_logging(exe_dir: &Path, master: &MasterConfig) -> Result<(), fern::Init
         })
         .level(level)
         .chain(std::io::stdout());
-    
-    
+
     if let Some(path) = log_path {
         dispatch = dispatch.chain(fern::log_file(path)?);
     }
-    
+
     dispatch.apply()?;
     Ok(())
 }
 
-/// Spawn an asynchronous `DbWriter` for the given event type.
 fn spawn_writer<E>(rt: &Runtime, conn: Connection, rx: async_mpsc::Receiver<E>)
 where
     E: BatchInsert<E> + Send + 'static,
@@ -160,54 +144,89 @@ where
     });
 }
 
-/// Convert configured directory-risk sections into scanner groups.
 fn build_scanner_groups(master: &MasterConfig) -> Vec<RiskGroup> {
     [
-        (DirectoryRisk::High, &master.scanner.high),
+        (DirectoryRisk::High,   &master.scanner.high),
         (DirectoryRisk::Medium, &master.scanner.medium),
-        (DirectoryRisk::Low, &master.scanner.low),
-        (DirectoryRisk::Special, &master.scanner.special),
+        (DirectoryRisk::Low,    &master.scanner.low),
+        (DirectoryRisk::Special,&master.scanner.special),
     ]
         .into_iter()
-        .filter_map(|(risk, cfg)| {
-            cfg.as_ref()
-                .map(|c| convert_config_to_risk_group(risk, c.clone()))
-        })
+        .filter_map(|(risk, cfg)| cfg.as_ref().map(|c| convert_config_to_risk_group(risk, c.clone())))
         .filter(|g| g.scheduled_interval.is_some())
         .collect()
 }
 
-// ───── service logic ────────────────────────────────────────────────────────
+fn spawn_ttl_cleanup(rt: &Runtime, db_path: PathBuf, ttl_seconds: i64) {
+    let one_hour = Duration::from_secs(3600);
+    rt.spawn(async move {
+        let mut ticker = tokio::time::interval(one_hour);
+        loop {
+            ticker.tick().await;
+            if let Ok(conn) = Connection::open(&db_path) {
+                let cutoff = chrono::Utc::now().timestamp() - ttl_seconds;
+                let _ = conn.execute("DELETE FROM fs_events    WHERE ts < ?1", [cutoff]);
+                let _ = conn.execute("DELETE FROM network_events WHERE ts < ?1", [cutoff]);
+                let _ = conn.execute("DELETE FROM etw_events    WHERE ts < ?1", [cutoff]);
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                log::info!("TTL cleanup: removed events before {}", cutoff);
+            }
+        }
+    });
+}
+
+fn spawn_wal_maintenance(rt: &Runtime, db_path: PathBuf) {
+    let ten_min = Duration::from_secs(600);
+    rt.spawn(async move {
+        let mut ticker = tokio::time::interval(ten_min);
+        loop {
+            ticker.tick().await;
+            if let Ok(conn) = Connection::open(&db_path) {
+                if let Ok(mode) = conn.query_row("PRAGMA journal_mode;", [], |r| r.get::<_, String>(0)) {
+                    log::debug!("PRAGMA journal_mode = {}", mode);
+                }
+                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                    log::warn!("WAL checkpoint failed: {}", e);
+                }
+            }
+        }
+    });
+}
 
 fn run_service() {
-    // 1 ─ Context
-    let exe_dir = exe_dir();
-    let master = load_master_cfg(&exe_dir);
+    // Context & config
+    let exe = exe_dir();
+    let master = load_master_cfg(&exe);
 
-    // 2 ─ Logging
-    setup_logging(&exe_dir, &master).expect("Logging setup failed");
+    // Logging
+    setup_logging(&exe, &master).expect("Logging setup failed");
     log::info!("Service bootstrap initiated");
 
-    // 3 ─ Database
-    let db_path = exe_dir.join("telemetry.db");
+    // Metrics endpoint
+    let _recorder = PrometheusBuilder::new().install();
+
+    // Database
+    let db_path   = exe.join("telemetry.db");
     let conn_file = init_database(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
-    let conn_net = open_db_connection(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
-    let conn_etw = open_db_connection(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
+    let conn_net  = open_db_connection(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
+    let conn_etw  = open_db_connection(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
 
-    // 4 ─ Tokio runtime & DB writers
-    let rt = Runtime::new().expect("Tokio runtime creation failed");
-
+    // Tokio & DB writers
+    let rt = Runtime::new().expect("Tokio runtime failed");
     let (_file_tx, file_rx) = async_mpsc::channel::<FileEvent>(10_000);
-    let (_net_tx, net_rx) = async_mpsc::channel::<NetworkEvent>(10_000);
-    let (_etw_tx, etw_rx) = async_mpsc::channel::<EtwEvent>(10_000);
+    let (_net_tx,  net_rx ) = async_mpsc::channel::<NetworkEvent>(10_000);
+    let (_etw_tx,  etw_rx ) = async_mpsc::channel::<EtwEvent>(10_000);
 
     spawn_writer(&rt, conn_file, file_rx);
-    spawn_writer(&rt, conn_net, net_rx);
-    spawn_writer(&rt, conn_etw, etw_rx);
+    spawn_writer(&rt, conn_net,  net_rx);
+    spawn_writer(&rt, conn_etw,  etw_rx);
 
-    // TODO: wire *_tx into the comms subsystem.
+    // TTL & WAL maintenance
+    let ttl_secs = 7 * 24 * 3600; // 7 days
+    spawn_ttl_cleanup(&rt, db_path.clone(), ttl_secs);
+    spawn_wal_maintenance(&rt, db_path.clone());
 
-    // 5 ─ Windows SCM registration
+    // Windows SCM
     let (svc_tx, svc_rx) = mpsc::sync_channel(1);
     let status_handle = service_control_handler::register(
         SERVICE_NAME,
@@ -220,8 +239,7 @@ fn run_service() {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         },
-    )
-        .unwrap();
+    ).unwrap();
 
     let mut status = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -234,36 +252,31 @@ fn run_service() {
     };
     status_handle.set_service_status(status.clone()).unwrap();
 
-    // 6 ─ Scanner
-    let scanner_groups = build_scanner_groups(&master);
+    // Scanner thread
     status.current_state = ServiceState::Running;
     status_handle.set_service_status(status.clone()).unwrap();
-    log::info!("Service running with {} scanner group(s)", scanner_groups.len());
+    let groups     = build_scanner_groups(&master);
+    log::info!("Service running with {} scanner groups", groups.len());
+    let cache_path = exe.join("persistent_cache.json");
+    thread::spawn(move || run_scanner(groups, cache_path));
 
-    let cache_path = exe_dir.join("persistent_cache.json");
-    thread::spawn(move || run_scanner(scanner_groups, cache_path));
-
-    // 7 ─ Wait for shutdown
+    // Shutdown
     let _ = svc_rx.recv();
     log::warn!("Shutdown initiated");
-
     status.current_state = ServiceState::Stopped;
     status_handle.set_service_status(status).unwrap();
     log::info!("Service stopped cleanly");
 }
 
-// Windows SCM entry point.
 fn service_main(_args: Vec<OsString>) {
     run_service();
 }
 
 fn main() {
-    // If registering as a service fails, run as a plain console app.
-    if let Err(e) = start(SERVICE_NAME, ffi_service_main) {
+    if start(SERVICE_NAME, ffi_service_main).is_err() {
         eprintln!(
-            "[{}][ERROR][main] Not a service: {} – falling back to console.",
-            Local::now().to_rfc3339(),
-            e
+            "[{}][ERROR][main] Not a service; falling back to console.",
+            Local::now().to_rfc3339()
         );
         run_service();
     }
