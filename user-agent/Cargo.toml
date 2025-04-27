@@ -12,7 +12,7 @@ sha2 = "0.11.0-pre.5"
 hex = "0.4.3"
 toml = "0.8.20"
 chrono = { version = "0.4", features = ["serde"] }
-prost = "0.13.5"
+fern = "0.7.1"
 prost-types = "0.13.5"
 anyhow = "1.0"
 shared = { path = "../shared" }
@@ -20,5 +20,9 @@ log             = "0.4"
 simplelog      = "0.12"
 windows-service = "0.8.0"
 eventlog       = "0.3.0"
+tokio = "1.44.2"
+time = "0.3.41"
+thiserror = "1.0.69"
+rusqlite = { version = "0.35", features = ["unlock_notify", "bundled"] }
 
 

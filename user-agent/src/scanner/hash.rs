@@ -8,7 +8,6 @@
 //! - Compute `XxHash64` of file contents.
 //! - Detect executable files by extension.
 
-use crate::gladix_log;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -22,7 +21,7 @@ pub fn is_executable_file(path: &Path, exts: &[String]) -> bool {
         .map_or(false, |ext| {
             exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(&ext))
         });
-    gladix_log!(Level::Debug, "is_executable_file: {:?} → {}", path, result);
+    log::debug!( "is_executable_file: {:?} → {}", path, result);
     result
 }
 
@@ -33,6 +32,6 @@ pub fn compute_file_hash(path: &Path) -> std::io::Result<u64> {
     let mut rdr = BufReader::new(f);
     rdr.read_to_end(&mut buf)?;
     let hash = XxHash64::oneshot(0, &buf);
-    gladix_log!(Level::Debug, "compute_file_hash: {:?} → {}", path, hash);
+    log::debug!( "compute_file_hash: {:?} → {}", path, hash);
     Ok(hash)
 }

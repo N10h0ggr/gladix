@@ -8,3 +8,6 @@
 //! - Perform age-based cleanup and purging.
 //! - Support batch inserts for performance.
 //! - Apply SQLite tuning via pragmas.
+
+pub mod db_writer;
+pub mod batch_inserts;

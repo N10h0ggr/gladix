@@ -2,7 +2,6 @@
 
 //! Task scheduler & directory scanner.
 
-use crate::gladix_log;
 use super::cache::{load_persistent_cache, save_persistent_cache};
 use super::worker::process_files;
 use crate::config::types::RiskGroup;
@@ -30,7 +29,7 @@ fn list_files(dir: &std::path::Path) -> Vec<PathBuf> {
         }
     }
 
-    gladix_log!(Level::Debug, "list_files: {:?} → {} entries", dir, out.len());
+    log::debug!( "list_files: {:?} → {} entries", dir, out.len());
     out
 }
 
@@ -48,7 +47,7 @@ pub fn run_scanner(groups: Vec<RiskGroup>, cache_path: PathBuf) {
     // Maximum file size to process (50 MB)
     let max_size = 50 * 1024 * 1024;
 
-    gladix_log!(Level::Info, "Scheduling {} group(s)", groups.len());
+    log::info!( "Scheduling {} group(s)", groups.len());
 
     for group in groups {
         let cache_cloned = Arc::clone(&cache);
@@ -62,22 +61,22 @@ pub fn run_scanner(groups: Vec<RiskGroup>, cache_path: PathBuf) {
             .as_secs();
 
         thread::spawn(move || {
-            gladix_log!(Level::Info, "Thread for {:?} starting (interval={}s)", group.risk, secs);
+            log::info!( "Thread for {:?} starting (interval={}s)", group.risk, secs);
 
             loop {
-                gladix_log!(Level::Info, "[{:?}] Starting scan pass", group.risk);
+                log::info!( "[{:?}] Starting scan pass", group.risk);
 
                 for dir in &dirs {
                     if !dir.exists() {
                         // Warn and skip directories that may have been removed
-                        gladix_log!(Level::Warn, "Skipping non-existent dir: {:?}", dir);
+                        log::warn!("Skipping non-existent dir: {:?}", dir);
                         continue;
                     }
-                    gladix_log!(Level::Info, "Scanning {:?}", dir);
+                    log::info!("Scanning {:?}", dir);
 
                     // Collect candidate files (expensive I/O)
                     let files = list_files(dir);
-                    gladix_log!(Level::Debug, "Found {} candidates in {:?}", files.len(), dir);
+                    log::debug!( "Found {} candidates in {:?}", files.len(), dir);
 
                     // Parallel processing; ignores errors inside
                     process_files(files, Arc::clone(&cache_cloned), max_size, Arc::clone(&exts_cloned));
@@ -85,8 +84,8 @@ pub fn run_scanner(groups: Vec<RiskGroup>, cache_path: PathBuf) {
 
                 // Persist updated cache after each pass
                 save_persistent_cache(&cache_file, &*cache_cloned.lock().unwrap());
-                gladix_log!(Level::Info, "[{:?}] Cache written to {:?}", group.risk, cache_file);
-                gladix_log!(Level::Debug, "[{:?}] Sleeping for {}s", group.risk, secs);
+                log::info!( "[{:?}] Cache written to {:?}", group.risk, cache_file);
+                log::debug!( "[{:?}] Sleeping for {}s", group.risk, secs);
 
                 // Sleep until next scheduled scan iteration
                 thread::sleep(Duration::from_secs(secs));

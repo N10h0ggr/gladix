@@ -2,7 +2,6 @@
 
 //! Persistent file‐scan cache with HMAC integrity checks.
 
-use crate::gladix_log;
 use std::{
     collections::{BTreeMap, HashMap},
     fs, fs::File,
@@ -71,16 +70,16 @@ pub fn load_persistent_cache<P: AsRef<Path>>(path: P) -> HashMap<PathBuf, FileCa
             // Re-serialize only the data portion for signature comparison
             if let Ok(json_data) = serde_json::to_string_pretty(&wrapper.data) {
                 if compute_signature(&json_data) == wrapper.signature {
-                    gladix_log!(Level::Info, "Loaded cache from {:?}", path.as_ref());
+                    log::info!("Loaded cache from {:?}", path.as_ref());
                     return convert_cache_from_string_keys(wrapper.data);
                 } else {
-                    gladix_log!(Level::Warn, "Signature mismatch for {:?}; starting fresh", path.as_ref());
+                    log::warn!("Signature mismatch for {:?}; starting fresh", path.as_ref());
                 }
             }
         }
     }
     // Any failure -> empty cache + log info
-    gladix_log!(Level::Info, "No valid cache at {:?}; using empty", path.as_ref());
+    log::info!( "No valid cache at {:?}; using empty", path.as_ref());
     HashMap::new()
 }
 
@@ -99,14 +98,14 @@ pub fn save_persistent_cache<P: AsRef<Path>>(path: P, cache: &HashMap<PathBuf, F
                 Ok(mut f) => {
                     // Write atomically; errors logged but not fatal
                     if let Err(e) = f.write_all(serialized.as_bytes()) {
-                        gladix_log!(Level::Error, "Failed write {:?}: {}", path.as_ref(), e);
+                        log::error!( "Failed write {:?}: {}", path.as_ref(), e);
                     } else {
-                        gladix_log!(Level::Info, "Saved cache to {:?}", path.as_ref());
+                        log::info!( "Saved cache to {:?}", path.as_ref());
                     }
                 }
                 Err(e) => {
                     // Directory missing or permissions issue
-                    gladix_log!(Level::Error, "Cannot create {:?}: {}", path.as_ref(), e);
+                    log::error!( "Cannot create {:?}: {}", path.as_ref(), e);
                 }
             }
         }

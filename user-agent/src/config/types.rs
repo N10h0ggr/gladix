@@ -37,7 +37,7 @@ impl Default for LoggingConfig {
 }
 
 /// Holds all scanner group settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RiskGroupConfig {
     pub directories: Vec<String>,
     pub scheduled_interval: Option<u64>,

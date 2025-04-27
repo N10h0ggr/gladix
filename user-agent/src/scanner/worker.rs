@@ -2,7 +2,6 @@
 
 //! Concurrent file‐processing engine.
 
-use crate::gladix_log;
 use super::cache::FileCacheEntry;
 use super::hash::{compute_file_hash, is_executable_file};
 use std::{
@@ -28,7 +27,7 @@ fn process_file(
 
     // Skip based on size or file type to minimize unnecessary I/O and hashing.
     if meta.len() > max_size || !is_executable_file(path, exts) {
-        gladix_log!(Level::Debug, "Ignored {:?} (size={}, exe={})", path, meta.len(), is_executable_file(path, exts));
+        log::debug!( "Ignored {:?} (size={}, exe={})", path, meta.len(), is_executable_file(path, exts));
         return Ok(());
     }
 
@@ -56,7 +55,7 @@ fn process_file(
         path.to_owned(),
         FileCacheEntry { hash, timestamp: mtime, scan_result: Some("Processed".into()) },
     );
-    gladix_log!(Level::Debug, "Processed {:?} (hash={})", path, hash);
+    log::debug!( "Processed {:?} (hash={})", path, hash);
     Ok(())
 }
 
