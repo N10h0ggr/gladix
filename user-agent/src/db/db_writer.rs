@@ -3,6 +3,7 @@
 use rusqlite::{Connection, Statement};
 use std::{thread::sleep, time::{Duration, Instant}};
 use thiserror::Error;
+use metrics::{histogram, counter};
 
 /// Defines how to insert a batch of events of type T
 pub trait BatchInsert<T> {
@@ -58,15 +59,17 @@ where
         }
     }
 
-    /// Synchronous flush with retry + backoff.
+    /// Synchronous flush with retry + backoff, and real metrics.
     fn flush_sync(&mut self, buffer: &mut Vec<T>) -> Result<(), DbError>
     where
         T: BatchInsert<T>,
     {
+        // Capture how many we’ll flush in this call
+        let batch_count = buffer.len() as f64;
         let start = Instant::now();
         let mut attempts = 0;
 
-        while !buffer.is_empty() {
+        while batch_count > 0.0 && !buffer.is_empty() {
             match self.conn.transaction() {
                 Ok(tx) => {
                     {
@@ -77,10 +80,11 @@ where
                     }
                     tx.commit()?;
 
-                    // TODO: record metrics here, e.g.
-                    //   histogram!("db_flush_duration_seconds", start.elapsed().as_secs_f64());
-                    //   histogram!("db_flush_batch_size", batch_size as f64);
-                    //   counter!("db_flush_batches_total");
+                    // --- RECORD METRICS ---
+                    let elapsed = start.elapsed().as_secs_f64();
+                    histogram!("db_flush_duration_seconds").record(elapsed);
+                    histogram!("db_flush_batch_size").record(batch_count);
+                    counter!("db_flush_batches_total").increment(1);
                 }
                 Err(e) if e.to_string().contains("database is locked") && attempts < 5 => {
                     attempts += 1;
