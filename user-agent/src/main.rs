@@ -16,7 +16,6 @@ mod scanner;
 use chrono::Local;
 use fern::Dispatch;
 use log::LevelFilter;
-use rusqlite::Connection;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -37,10 +36,11 @@ use windows_service::{
     service_dispatcher::start,
 };
 
-use config::{convert_config_to_risk_group, load_master_config};
-use config::types::{DirectoryRisk, MasterConfig, RiskGroup};
+use config::{load_master_config, convert_config_to_risk_group};
+use config::types::{MasterConfig, RiskGroup, DirectoryRisk};
 use comms::events::{EtwEvent, FileEvent, NetworkEvent};
-use db::db_writer::{BatchInsert, DbWriter};
+use db::{connection::init_database, connection::open_db_connection, maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance}, spawn_writer};
+
 use metrics_exporter_prometheus::PrometheusBuilder;
 use scanner::run_scanner;
 
@@ -73,24 +73,6 @@ fn load_master_cfg(exe_dir: &Path) -> MasterConfig {
         .unwrap_or_else(|e| fatal!("config", "{}", e))
 }
 
-fn open_db_connection(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.pragma_update(None, "journal_mode", &"WAL")?;
-    conn.pragma_update(None, "synchronous", &"NORMAL")?;
-    Ok(conn)
-}
-
-fn init_database(db_path: &Path) -> rusqlite::Result<Connection> {
-    let first_run = !db_path.exists();
-    let conn = open_db_connection(db_path)?;
-    conn.pragma_update(None, "journal_size_limit", &50_000_000_i64)?;
-    if first_run {
-        let schema = include_str!("../resources/schema.sql");
-        conn.execute_batch(schema)?;
-    }
-    log::info!("Database ready at {}", db_path.display());
-    Ok(conn)
-}
 
 fn setup_logging(exe_dir: &Path, master: &MasterConfig) -> Result<(), fern::InitError> {
     let level = match master.logging.level.to_uppercase().as_str() {
@@ -128,22 +110,6 @@ fn setup_logging(exe_dir: &Path, master: &MasterConfig) -> Result<(), fern::Init
     Ok(())
 }
 
-fn spawn_writer<E>(rt: &Runtime, conn: Connection, rx: async_mpsc::Receiver<E>)
-where
-    E: BatchInsert<E> + Send + 'static,
-{
-    rt.spawn(async move {
-        DbWriter::<E> {
-            conn,
-            rx,
-            flush_interval_ms: 250,
-            batch_size: 1_000,
-        }
-            .run()
-            .await;
-    });
-}
-
 fn build_scanner_groups(master: &MasterConfig) -> Vec<RiskGroup> {
     [
         (DirectoryRisk::High,   &master.scanner.high),
@@ -157,47 +123,12 @@ fn build_scanner_groups(master: &MasterConfig) -> Vec<RiskGroup> {
         .collect()
 }
 
-fn spawn_ttl_cleanup(rt: &Runtime, db_path: PathBuf, ttl_seconds: i64) {
-    let one_hour = Duration::from_secs(3600);
-    rt.spawn(async move {
-        let mut ticker = tokio::time::interval(one_hour);
-        loop {
-            ticker.tick().await;
-            if let Ok(conn) = Connection::open(&db_path) {
-                let cutoff = chrono::Utc::now().timestamp() - ttl_seconds;
-                let _ = conn.execute("DELETE FROM fs_events    WHERE ts < ?1", [cutoff]);
-                let _ = conn.execute("DELETE FROM network_events WHERE ts < ?1", [cutoff]);
-                let _ = conn.execute("DELETE FROM etw_events    WHERE ts < ?1", [cutoff]);
-                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-                log::info!("TTL cleanup: removed events before {}", cutoff);
-            }
-        }
-    });
-}
-
-fn spawn_wal_maintenance(rt: &Runtime, db_path: PathBuf) {
-    let ten_min = Duration::from_secs(600);
-    rt.spawn(async move {
-        let mut ticker = tokio::time::interval(ten_min);
-        loop {
-            ticker.tick().await;
-            if let Ok(conn) = Connection::open(&db_path) {
-                if let Ok(mode) = conn.query_row("PRAGMA journal_mode;", [], |r| r.get::<_, String>(0)) {
-                    log::debug!("PRAGMA journal_mode = {}", mode);
-                }
-                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                    log::warn!("WAL checkpoint failed: {}", e);
-                }
-            }
-        }
-    });
-}
 
 fn run_service() {
     // Context & config
-    let exe = exe_dir();
+    let exe    = exe_dir();
     let master = load_master_cfg(&exe);
-
+    
     // Logging
     setup_logging(&exe, &master).expect("Logging setup failed");
     log::info!("Service bootstrap initiated");
@@ -206,25 +137,28 @@ fn run_service() {
     let _recorder = PrometheusBuilder::new().install();
 
     // Database
-    let db_path   = exe.join("telemetry.db");
-    let conn_file = init_database(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
-    let conn_net  = open_db_connection(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
-    let conn_etw  = open_db_connection(&db_path).unwrap_or_else(|e| fatal!("database", "{}", e));
+    let db_cfg  = &master.database;
+    let db_path = db::connection::db_path(&exe, db_cfg);
+
+    let conn_file = init_database(&exe, db_cfg).unwrap_or_else(|e| fatal!("database", "{}", e));
+    let conn_net  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{}", e));
+    let conn_etw  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{}", e));
+
 
     // Tokio & DB writers
     let rt = Runtime::new().expect("Tokio runtime failed");
     let (_file_tx, file_rx) = async_mpsc::channel::<FileEvent>(10_000);
     let (_net_tx,  net_rx ) = async_mpsc::channel::<NetworkEvent>(10_000);
     let (_etw_tx,  etw_rx ) = async_mpsc::channel::<EtwEvent>(10_000);
+    
+    // when spawning writers
+    spawn_writer(&rt, conn_file, file_rx, db_cfg);
+    spawn_writer(&rt, conn_net,  net_rx,  db_cfg);
+    spawn_writer(&rt, conn_etw,  etw_rx,  db_cfg);
 
-    spawn_writer(&rt, conn_file, file_rx);
-    spawn_writer(&rt, conn_net,  net_rx);
-    spawn_writer(&rt, conn_etw,  etw_rx);
-
-    // TTL & WAL maintenance
-    let ttl_secs = 7 * 24 * 3600; // 7 days
-    spawn_ttl_cleanup(&rt, db_path.clone(), ttl_secs);
-    spawn_wal_maintenance(&rt, db_path.clone());
+    // background tasks
+    spawn_ttl_cleanup(&rt, db_path.clone(), db_cfg);
+    spawn_wal_maintenance(&rt, db_path.clone(), db_cfg);
 
     // Windows SCM
     let (svc_tx, svc_rx) = mpsc::sync_channel(1);

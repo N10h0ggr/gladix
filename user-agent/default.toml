@@ -18,8 +18,23 @@ directories = ["C:\\Users\\Noel\\SomeManualDir"]
 # manual only
 directories = ["C:\\Users\\Noel\\SpecialDir"]
 
-
 [logging]
 enable = true
 file = "logs/agent.log"
 level = "DEBUG"
+
+[database]
+# Relative to the agent exe
+path                = "telemetry.db"
+# Delete the DB on every restart while testing
+purge_on_restart    = true
+
+# SQLite tuning
+synchronous         = "NORMAL"      # FULL | NORMAL | OFF
+journal_size_limit  = 20_000_000    # bytes
+checkpoint_seconds  = 30            # every 30 s
+ttl_seconds         = 86400         # 24 h retention
+
+# Writer tuning
+flush_interval_ms   = 250           # ~4 flushes/s
+batch_size          = 1000

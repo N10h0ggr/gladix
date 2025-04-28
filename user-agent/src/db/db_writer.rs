@@ -1,15 +1,10 @@
 // src/db/db_writer.rs
 
-use rusqlite::{Connection, Statement};
-use std::{thread::sleep, time::{Duration, Instant}};
+use rusqlite::Connection;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use metrics::{histogram, counter};
-
-/// Defines how to insert a batch of events of type T
-pub trait BatchInsert<T> {
-    fn insert_sql() -> &'static str;
-    fn bind_params(stmt: &mut Statement<'_>, record: &T) -> rusqlite::Result<()>;
-}
+use crate::db::batch_inserts::BatchInsert; // trae el trait extendido
 
 /// A high-performance, batched writer for SQLite.
 /// Performs all DB work synchronously to avoid holding &Connection across .await.
@@ -28,13 +23,9 @@ pub enum DbError {
 
 impl<T> DbWriter<T>
 where
-    T: Send + 'static,
+    T: Send + 'static + BatchInsert<T>,
 {
-    /// Start the writer loop; call inside tokio::spawn.
-    pub async fn run(mut self)
-    where
-        T: BatchInsert<T>,
-    {
+    pub async fn run(mut self) {
         let mut buffer = Vec::with_capacity(self.batch_size);
         let mut interval = tokio::time::interval(Duration::from_millis(self.flush_interval_ms));
 
@@ -59,40 +50,28 @@ where
         }
     }
 
-    /// Synchronous flush with retry + backoff, and real metrics.
-    fn flush_sync(&mut self, buffer: &mut Vec<T>) -> Result<(), DbError>
-    where
-        T: BatchInsert<T>,
-    {
-        // Capture how many we’ll flush in this call
+    fn flush_sync(&mut self, buffer: &mut Vec<T>) -> Result<(), DbError> {
         let batch_count = buffer.len() as f64;
-        let start = Instant::now();
-        let mut attempts = 0;
-
-        while batch_count > 0.0 && !buffer.is_empty() {
-            match self.conn.transaction() {
-                Ok(tx) => {
-                    {
-                        let mut stmt = tx.prepare_cached(T::insert_sql())?;
-                        for rec in buffer.drain(..) {
-                            T::bind_params(&mut stmt, &rec)?;
-                        }
-                    }
-                    tx.commit()?;
-
-                    // --- RECORD METRICS ---
-                    let elapsed = start.elapsed().as_secs_f64();
-                    histogram!("db_flush_duration_seconds").record(elapsed);
-                    histogram!("db_flush_batch_size").record(batch_count);
-                    counter!("db_flush_batches_total").increment(1);
-                }
-                Err(e) if e.to_string().contains("database is locked") && attempts < 5 => {
-                    attempts += 1;
-                    sleep(Duration::from_millis(50 * attempts));
-                }
-                Err(e) => return Err(DbError::Sql(e)),
-            }
+        if batch_count == 0.0 {
+            return Ok(());
         }
+
+        let start = Instant::now();
+        let sql = T::insert_sql();
+        let mut stmt = self.conn.prepare_cached(sql)?;
+
+        for rec in buffer.drain(..) {
+            T::bind_and_execute(&mut stmt, &rec)?;
+        }
+
+        // Record metrics
+        let elapsed = start.elapsed().as_secs_f64();
+        histogram!("db_flush_duration_seconds").record(elapsed);
+        histogram!("db_flush_batch_size").record(batch_count);
+        counter!("db_flush_batches_total").increment(1);
+
         Ok(())
     }
 }
+
+
