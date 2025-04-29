@@ -18,11 +18,13 @@ desktop-app/src-tauri/Cargo.lock
 
 # === Project-specific files ===
 user-agent/persistent_cache.json
+user-agent/telemetry.db
 kernel-driver/*.inx
 
 # === Editor ===
 .vscode/
 *.code-workspace
+.idea/
 
 # === Logs and OS ===
 *.log
