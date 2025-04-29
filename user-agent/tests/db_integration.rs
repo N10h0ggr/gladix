@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, thread::sleep, time::Duration};
+use std::{path::PathBuf, thread::sleep, time::Duration};
 use tokio::{runtime::Runtime, sync::mpsc};
 use rusqlite::Connection;
 use chrono::Utc;
@@ -25,24 +25,19 @@ fn file_event_flushed_to_db() {
     let exe_dir = project_root();
     let cfg: AppConfig = load(&exe_dir.join("config.toml")).expect("failed to load config.toml");
 
-    // Unique temporary DB file
     let tmp = NamedTempFile::new().expect("create tmpfile");
     let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
-    drop(tmp);
 
-    // Configure DB
     let mut db_cfg = cfg.database;
-    db_cfg.path = file_name.clone();
+    db_cfg.path = file_name;
     db_cfg.purge_on_restart = true;
 
-    // Init DB and writer
     let conn = init_database(&exe_dir, &db_cfg).expect("init_database failed");
     let db_file = db_path(&exe_dir, &db_cfg);
     let rt = Runtime::new().unwrap();
     let (tx, rx) = mpsc::channel::<FileEvent>(1);
     spawn_writer(&rt, conn, rx, &db_cfg);
 
-    // Send event
     tx.blocking_send(FileEvent {
         ts: Utc::now(),
         sensor_guid: "FILE-EVENT".into(),
@@ -61,9 +56,6 @@ fn file_event_flushed_to_db() {
     let conn2 = Connection::open(&db_file).unwrap();
     let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM fs_events", [], |r| r.get(0)).unwrap();
     assert_eq!(cnt, 1, "Expected one fs_events row");
-
-    // Clean up
-    fs::remove_file(&db_file).ok();
 }
 
 #[test]
@@ -73,10 +65,9 @@ fn network_event_flushed_to_db() {
 
     let tmp = NamedTempFile::new().expect("create tmpfile");
     let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
-    drop(tmp);
 
     let mut db_cfg = cfg.database;
-    db_cfg.path = file_name.clone();
+    db_cfg.path = file_name;
     db_cfg.purge_on_restart = true;
 
     let conn = init_database(&exe_dir, &db_cfg).unwrap();
@@ -105,8 +96,6 @@ fn network_event_flushed_to_db() {
     let conn2 = Connection::open(&db_file).unwrap();
     let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM network_events", [], |r| r.get(0)).unwrap();
     assert_eq!(cnt, 1, "Expected one network_events row");
-
-    fs::remove_file(&db_file).ok();
 }
 
 #[test]
@@ -116,10 +105,9 @@ fn etw_event_flushed_to_db() {
 
     let tmp = NamedTempFile::new().expect("create tmpfile");
     let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
-    drop(tmp);
 
     let mut db_cfg = cfg.database;
-    db_cfg.path = file_name.clone();
+    db_cfg.path = file_name;
     db_cfg.purge_on_restart = true;
 
     let conn = init_database(&exe_dir, &db_cfg).unwrap();
@@ -144,8 +132,6 @@ fn etw_event_flushed_to_db() {
     let conn2 = Connection::open(&db_file).unwrap();
     let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM etw_events", [], |r| r.get(0)).unwrap();
     assert_eq!(cnt, 1, "Expected one etw_events row");
-
-    fs::remove_file(&db_file).ok();
 }
 
 #[test]
@@ -155,12 +141,11 @@ fn flush_on_close_under_batch_size() {
 
     let tmp = NamedTempFile::new().expect("create tmpfile");
     let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
-    drop(tmp);
 
     let mut db_cfg = cfg.database;
     db_cfg.batch_size = 5;
     db_cfg.flush_interval_ms = 50;
-    db_cfg.path = file_name.clone();
+    db_cfg.path = file_name;
     db_cfg.purge_on_restart = true;
 
     let conn = init_database(&exe_dir, &db_cfg).expect("init_database");
@@ -191,6 +176,4 @@ fn flush_on_close_under_batch_size() {
     let conn2 = Connection::open(&db_file).unwrap();
     let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM network_events", [], |r| r.get(0)).unwrap();
     assert_eq!(cnt, 3, "writer must flush remaining <batch events on close");
-
-    fs::remove_file(&db_file).ok();
-}
+} 
