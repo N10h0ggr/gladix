@@ -1,9 +1,8 @@
-// tests/db_integration.rs
-
-use std::{path::PathBuf, thread::sleep, time::Duration};
+use std::{fs, path::PathBuf, thread::sleep, time::Duration};
 use tokio::{runtime::Runtime, sync::mpsc};
 use rusqlite::Connection;
 use chrono::Utc;
+use tempfile::NamedTempFile;
 
 use agent::{
     db::{connection::{init_database, db_path}, spawn_writer},
@@ -23,23 +22,27 @@ fn project_root() -> PathBuf {
 
 #[test]
 fn file_event_flushed_to_db() {
-    // 1. Load our app config from `config.toml`
     let exe_dir = project_root();
-    let cfg: AppConfig = load(&exe_dir.join("config.toml"))
-        .expect("failed to load config.toml");
-    let db_cfg = &cfg.database;
+    let cfg: AppConfig = load(&exe_dir.join("config.toml")).expect("failed to load config.toml");
 
-    // 2. Init DB (will purge any existing telemetry.db as per your config)
-    let conn = init_database(&exe_dir, db_cfg).expect("init_database failed");
-    let db_file = db_path(&exe_dir, db_cfg);
-    println!("[file_event] Using telemetry.db at {:?}", db_file);
+    // Unique temporary DB file
+    let tmp = NamedTempFile::new().expect("create tmpfile");
+    let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
+    drop(tmp);
 
-    // 3. Spawn writer
+    // Configure DB
+    let mut db_cfg = cfg.database;
+    db_cfg.path = file_name.clone();
+    db_cfg.purge_on_restart = true;
+
+    // Init DB and writer
+    let conn = init_database(&exe_dir, &db_cfg).expect("init_database failed");
+    let db_file = db_path(&exe_dir, &db_cfg);
     let rt = Runtime::new().unwrap();
     let (tx, rx) = mpsc::channel::<FileEvent>(1);
-    spawn_writer(&rt, conn, rx, db_cfg);
+    spawn_writer(&rt, conn, rx, &db_cfg);
 
-    // 4. Send one FileEvents
+    // Send event
     tx.blocking_send(FileEvent {
         ts: Utc::now(),
         sensor_guid: "FILE-EVENT".into(),
@@ -52,32 +55,35 @@ fn file_event_flushed_to_db() {
         sha256: "deadbeef".into(),
         success: true,
     }).unwrap();
-
     drop(tx);
 
-    // 5. Wait & verify
     wait_for_flush(db_cfg.flush_interval_ms);
     let conn2 = Connection::open(&db_file).unwrap();
-    let cnt: i64 = conn2
-        .query_row("SELECT COUNT(*) FROM fs_events", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(cnt, 1, "Expected two fs_events rows");
+    let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM fs_events", [], |r| r.get(0)).unwrap();
+    assert_eq!(cnt, 1, "Expected one fs_events row");
+
+    // Clean up
+    fs::remove_file(&db_file).ok();
 }
 
 #[test]
 fn network_event_flushed_to_db() {
     let exe_dir = project_root();
-    let cfg: AppConfig = load(&exe_dir.join("config.toml"))
-        .expect("failed to load config.toml");
-    let db_cfg = &cfg.database;
+    let cfg: AppConfig = load(&exe_dir.join("config.toml")).expect("failed to load config.toml");
 
-    let conn = init_database(&exe_dir, db_cfg).unwrap();
-    let db_file = db_path(&exe_dir, db_cfg);
-    println!("[network_event] Using telemetry.db at {:?}", db_file);
+    let tmp = NamedTempFile::new().expect("create tmpfile");
+    let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
+    drop(tmp);
 
+    let mut db_cfg = cfg.database;
+    db_cfg.path = file_name.clone();
+    db_cfg.purge_on_restart = true;
+
+    let conn = init_database(&exe_dir, &db_cfg).unwrap();
+    let db_file = db_path(&exe_dir, &db_cfg);
     let rt = Runtime::new().unwrap();
     let (tx, rx) = mpsc::channel::<NetworkEvent>(1);
-    spawn_writer(&rt, conn, rx, db_cfg);
+    spawn_writer(&rt, conn, rx, &db_cfg);
 
     tx.blocking_send(NetworkEvent {
         ts: Utc::now(),
@@ -97,26 +103,30 @@ fn network_event_flushed_to_db() {
 
     wait_for_flush(db_cfg.flush_interval_ms);
     let conn2 = Connection::open(&db_file).unwrap();
-    let cnt: i64 = conn2
-        .query_row("SELECT COUNT(*) FROM network_events", [], |r| r.get(0))
-        .unwrap();
+    let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM network_events", [], |r| r.get(0)).unwrap();
     assert_eq!(cnt, 1, "Expected one network_events row");
+
+    fs::remove_file(&db_file).ok();
 }
 
 #[test]
 fn etw_event_flushed_to_db() {
     let exe_dir = project_root();
-    let cfg: AppConfig = load(&exe_dir.join("config.toml"))
-        .expect("failed to load config.toml");
-    let db_cfg = &cfg.database;
+    let cfg: AppConfig = load(&exe_dir.join("config.toml")).expect("failed to load config.toml");
 
-    let conn = init_database(&exe_dir, db_cfg).unwrap();
-    let db_file = db_path(&exe_dir, db_cfg);
-    println!("[etw_event] Using telemetry.db at {:?}", db_file);
+    let tmp = NamedTempFile::new().expect("create tmpfile");
+    let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
+    drop(tmp);
 
+    let mut db_cfg = cfg.database;
+    db_cfg.path = file_name.clone();
+    db_cfg.purge_on_restart = true;
+
+    let conn = init_database(&exe_dir, &db_cfg).unwrap();
+    let db_file = db_path(&exe_dir, &db_cfg);
     let rt = Runtime::new().unwrap();
     let (tx, rx) = mpsc::channel::<EtwEvent>(1);
-    spawn_writer(&rt, conn, rx, db_cfg);
+    spawn_writer(&rt, conn, rx, &db_cfg);
 
     tx.blocking_send(EtwEvent {
         ts: Utc::now(),
@@ -132,8 +142,55 @@ fn etw_event_flushed_to_db() {
 
     wait_for_flush(db_cfg.flush_interval_ms);
     let conn2 = Connection::open(&db_file).unwrap();
-    let cnt: i64 = conn2
-        .query_row("SELECT COUNT(*) FROM etw_events", [], |r| r.get(0))
-        .unwrap();
+    let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM etw_events", [], |r| r.get(0)).unwrap();
     assert_eq!(cnt, 1, "Expected one etw_events row");
+
+    fs::remove_file(&db_file).ok();
+}
+
+#[test]
+fn flush_on_close_under_batch_size() {
+    let exe_dir = project_root();
+    let cfg: AppConfig = load(&exe_dir.join("config.toml")).expect("failed to load config.toml");
+
+    let tmp = NamedTempFile::new().expect("create tmpfile");
+    let file_name = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
+    drop(tmp);
+
+    let mut db_cfg = cfg.database;
+    db_cfg.batch_size = 5;
+    db_cfg.flush_interval_ms = 50;
+    db_cfg.path = file_name.clone();
+    db_cfg.purge_on_restart = true;
+
+    let conn = init_database(&exe_dir, &db_cfg).expect("init_database");
+    let db_file = db_path(&exe_dir, &db_cfg);
+    let rt = Runtime::new().unwrap();
+    let (tx, rx) = mpsc::channel::<NetworkEvent>(1);
+    spawn_writer(&rt, conn, rx, &db_cfg);
+
+    for _ in 0..3 {
+        tx.blocking_send(NetworkEvent {
+            ts: Utc::now(),
+            sensor_guid: "BATCH".into(),
+            direction: Direction::Inbound,
+            proto: "UDP".into(),
+            src_ip: "1.2.3.4".into(),
+            src_port: 123,
+            dst_ip: "5.6.7.8".into(),
+            dst_port: 456,
+            pid: 42,
+            exe_path: "C:\\dummy.exe".into(),
+            bytes: 100,
+            blocked: false,
+        }).unwrap();
+    }
+    drop(tx);
+
+    wait_for_flush(db_cfg.flush_interval_ms);
+    let conn2 = Connection::open(&db_file).unwrap();
+    let cnt: i64 = conn2.query_row("SELECT COUNT(*) FROM network_events", [], |r| r.get(0)).unwrap();
+    assert_eq!(cnt, 3, "writer must flush remaining <batch events on close");
+
+    fs::remove_file(&db_file).ok();
 }

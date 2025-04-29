@@ -22,7 +22,7 @@ pub struct LoggingConfig {
 fn default_level() -> String { "INFO".into() }
 
 /// Mirror of the `[database]` table — **no defaults**: must be present in TOML
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub path:               String,
     pub purge_on_restart:   bool,

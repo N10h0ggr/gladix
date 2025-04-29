@@ -32,4 +32,5 @@ rusqlite = { version = "0.35", features = ["unlock_notify", "bundled"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.17"
 humantime = "2.2.0"
+tempfile = "1.0"
 
