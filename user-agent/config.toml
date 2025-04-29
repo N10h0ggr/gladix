@@ -17,6 +17,10 @@ ttl_seconds        = 3600               # DB event delete time trigger
 flush_interval_ms  = 250
 batch_size         = 1000               # In-memory buffer size before commit to WAL
 
+# ─── Communications ────────────────────────────────────────────
+[communications]
+grpc_bind = "0.0.0.0:50051"
+
 # ─── Scanner: use an array of tables! ─────────────────────
 # High-risk scan every 60s
 [[scanner]]

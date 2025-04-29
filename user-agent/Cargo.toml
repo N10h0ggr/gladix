@@ -21,6 +21,7 @@ hex = "0.4.3"
 toml = "0.8.20"
 chrono = { version = "0.4", features = ["serde"] }
 fern = "0.7.1"
+prost = "0.13.5"
 prost-types = "0.13.5"
 anyhow = "1.0"
 shared = { path = "../shared" }
@@ -33,4 +34,9 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.17"
 humantime = "2.2.0"
 tempfile = "1.0"
+crossbeam = "0.8.4"
+tokio-stream = "0.1.17"
+futures = "0.3.31"
+async-trait = "0.1.88"
+tonic = { version = "0.13", features = ["transport"] }
 
