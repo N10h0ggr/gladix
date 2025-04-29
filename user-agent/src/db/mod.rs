@@ -8,7 +8,7 @@ pub mod batch_inserts;
 
 use rusqlite::Connection;
 use tokio::{runtime::Runtime, sync::mpsc as async_mpsc};
-use crate::config::types::DatabaseConfig;
+use crate::config::model::DatabaseConfig;
 pub use db_writer::DbWriter;
 pub use batch_inserts::BatchInsert;
 

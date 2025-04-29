@@ -31,5 +31,5 @@ thiserror = "2.0.12"
 rusqlite = { version = "0.35", features = ["unlock_notify", "bundled"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.17"
-tempfile = "3.19.1"
+humantime = "2.2.0"
 

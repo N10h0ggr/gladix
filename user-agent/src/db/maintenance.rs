@@ -4,7 +4,7 @@
 use std::{path::PathBuf, time::Duration};
 use rusqlite::Connection;
 use tokio::runtime::Runtime;
-use crate::config::types::DatabaseConfig;
+use crate::config::model::DatabaseConfig;
 
 pub fn spawn_ttl_cleanup(rt: &Runtime, db_path: PathBuf, cfg: &DatabaseConfig) {
     if cfg.ttl_seconds == 0 { return; }          // disabled

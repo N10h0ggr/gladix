@@ -4,7 +4,7 @@
 
 use super::cache::{load_persistent_cache, save_persistent_cache};
 use super::worker::process_files;
-use crate::config::types::RiskGroup;
+use crate::config::model::RiskGroup;
 use std::{
     fs,
     path::PathBuf,
@@ -56,7 +56,7 @@ pub fn run_scanner(groups: Vec<RiskGroup>, cache_path: PathBuf) {
         // Capture directories and scan interval ahead of thread loop
         let dirs: Vec<PathBuf> = group.directories.into_iter().collect();
         let secs = group
-            .scheduled_interval
+            .interval
             .expect("scheduled_interval must be set")
             .as_secs();
 

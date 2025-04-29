@@ -1,0 +1,41 @@
+# default.toml (or config.toml)
+
+# ─── Logging ─────────────────────────────────────────────
+[logging]
+enable = true
+file   = "logs/agent.log"
+level  = "DEBUG"
+
+# ─── Database ────────────────────────────────────────────
+[database]
+path               = "telemetry.db"
+purge_on_restart   = false
+synchronous        = "NORMAL"
+journal_size_limit = 20000000
+checkpoint_seconds = 30
+ttl_seconds        = 86400
+flush_interval_ms  = 250
+batch_size         = 1
+
+# ─── Scanner: use an array of tables! ─────────────────────
+# High-risk scan every 60s
+[[scanner]]
+risk     = "High"
+dirs     = ["C:\\Users\\Noel\\Downloads", "C:\\Programs"]
+interval = "60s"
+
+# Medium-risk scan every 300s
+[[scanner]]
+risk     = "Medium"
+dirs     = ["C:\\Users\\Noel\\Documents"]
+interval = "300s"
+
+# Low-risk (manual only)
+[[scanner]]
+risk = "Low"
+dirs = ["C:\\Users\\Noel\\SomeManualDir"]
+
+# Special (manual only)
+[[scanner]]
+risk = "Special"
+dirs = ["C:\\Users\\Noel\\SpecialDir"]

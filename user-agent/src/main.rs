@@ -1,12 +1,19 @@
 // src/main.rs
 
-//! Agent entry-point: Windows service or console fallback.
+//! Agent entry‑point: Windows service or console fallback.
 //!
-//! 1. Parse configuration & set up structured logging
-//! 2. Initialise SQLite (WAL/NORMAL) and spawn async writers
-//! 3. Register with the SCM (or run as a console fallback)
-//! 4. Launch the directory scanner in a blocking thread
-//! 5. Wait for Stop / Shutdown, then exit cleanly
+//! **Refactored** to leverage the new [`Config::load()`] API that returns a fully‑validated
+//! runtime configuration.  All bespoke glue for reading TOML, converting risk groups, and
+//! validating paths has been removed.
+//!
+//! Execution flow
+//! ————————————————————————————————————————————————————————————————————————
+//! 1. `Config::load()` merges embedded defaults → optional file → env vars → CLI.
+//! 2. Structured logging initialised from `cfg.logging`.
+//! 3. SQLite opened; async writers & maintenance tasks spawned.
+//! 4. Windows SCM registration (or console fallback).
+//! 5. Directory scanner launched in blocking thread.
+//! 6. Graceful shutdown via service control or Ctrl‑C.
 
 mod comms;
 mod config;
@@ -36,11 +43,13 @@ use windows_service::{
     service_dispatcher::start,
 };
 
-use config::{load_master_config, convert_config_to_risk_group};
-use config::types::{MasterConfig, RiskGroup, DirectoryRisk};
+use crate::config::{load, Config};
 use comms::events::{EtwEvent, FileEvent, NetworkEvent};
-use db::{connection::init_database, connection::open_db_connection, maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance}, spawn_writer};
-
+use db::{
+    connection::{init_database, open_db_connection},
+    maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance},
+    spawn_writer,
+};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use scanner::run_scanner;
 
@@ -60,6 +69,7 @@ macro_rules! fatal {
     }};
 }
 
+/// Returns the directory that contains the running executable.
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .expect("Cannot determine exe path")
@@ -68,24 +78,20 @@ fn exe_dir() -> PathBuf {
         .to_path_buf()
 }
 
-fn load_master_cfg(exe_dir: &Path) -> MasterConfig {
-    load_master_config(&exe_dir.join("default.toml"))
-        .unwrap_or_else(|e| fatal!("config", "{}", e))
-}
-
-
-fn setup_logging(exe_dir: &Path, master: &MasterConfig) -> Result<(), fern::InitError> {
-    let level = match master.logging.level.to_uppercase().as_str() {
+/// Initialise structured logging according to `cfg.logging`.
+fn setup_logging(cfg: &Config, exe_dir: &Path) -> Result<(), fern::InitError> {
+    let level = match cfg.logging.level.to_uppercase().as_str() {
         "ERROR" => LevelFilter::Error,
         "WARN"  => LevelFilter::Warn,
         "DEBUG" => LevelFilter::Debug,
         "TRACE" => LevelFilter::Trace,
-        _       => LevelFilter::Info,
+        _        => LevelFilter::Info,
     };
-    let log_path = master
+
+    let log_path = cfg
         .logging
         .enable
-        .then(|| exe_dir.join(master.logging.file.as_deref().unwrap_or("agent.log")));
+        .then(|| exe_dir.join(cfg.logging.file.as_deref().unwrap_or("agent.log")));
 
     let mut dispatch = Dispatch::new()
         .format(|out, msg, record| {
@@ -110,57 +116,56 @@ fn setup_logging(exe_dir: &Path, master: &MasterConfig) -> Result<(), fern::Init
     Ok(())
 }
 
-fn build_scanner_groups(master: &MasterConfig) -> Vec<RiskGroup> {
-    [
-        (DirectoryRisk::High,   &master.scanner.high),
-        (DirectoryRisk::Medium, &master.scanner.medium),
-        (DirectoryRisk::Low,    &master.scanner.low),
-        (DirectoryRisk::Special,&master.scanner.special),
-    ]
-        .into_iter()
-        .filter_map(|(risk, cfg)| cfg.as_ref().map(|c| convert_config_to_risk_group(risk, c.clone())))
-        .filter(|g| g.scheduled_interval.is_some())
-        .collect()
-}
-
-
 fn run_service() {
-    // Context & config
-    let exe    = exe_dir();
-    let master = load_master_cfg(&exe);
-    
-    // Logging
-    setup_logging(&exe, &master).expect("Logging setup failed");
+    // ────────────────────────────────────────────────────────────────────
+    // 1 ▸ Context & configuration
+    // ────────────────────────────────────────────────────────────────────
+    let exe_dir = exe_dir();
+
+    // Loader merges defaults → exe_dir/config.toml → env (APP__) → CLI (None here)
+    let cfg = load(&exe_dir.join("config.toml"))
+        .unwrap_or_else(|e| fatal!("config", "{}", e));
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2 ▸ Logging
+    // ────────────────────────────────────────────────────────────────────
+    setup_logging(&cfg, &exe_dir).expect("Logging setup failed");
     log::info!("Service bootstrap initiated");
 
-    // Metrics endpoint
+    // ────────────────────────────────────────────────────────────────────
+    // 3 ▸ Prometheus metrics
+    // ────────────────────────────────────────────────────────────────────
     let _recorder = PrometheusBuilder::new().install();
 
-    // Database
-    let db_cfg  = &master.database;
-    let db_path = db::connection::db_path(&exe, db_cfg);
+    // ────────────────────────────────────────────────────────────────────
+    // 4 ▸ Database initialisation
+    // ────────────────────────────────────────────────────────────────────
+    let db_cfg  = &cfg.database;
+    let db_path = db::connection::db_path(&exe_dir, db_cfg);
 
-    let conn_file = init_database(&exe, db_cfg).unwrap_or_else(|e| fatal!("database", "{}", e));
-    let conn_net  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{}", e));
-    let conn_etw  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{}", e));
+    let conn_file = init_database(&exe_dir, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
+    let conn_net  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
+    let conn_etw  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
 
-
-    // Tokio & DB writers
+    // ────────────────────────────────────────────────────────────────────
+    // 5 ▸ Tokio runtime & async DB writers
+    // ────────────────────────────────────────────────────────────────────
     let rt = Runtime::new().expect("Tokio runtime failed");
     let (_file_tx, file_rx) = async_mpsc::channel::<FileEvent>(10_000);
     let (_net_tx,  net_rx ) = async_mpsc::channel::<NetworkEvent>(10_000);
     let (_etw_tx,  etw_rx ) = async_mpsc::channel::<EtwEvent>(10_000);
-    
-    // when spawning writers
+
     spawn_writer(&rt, conn_file, file_rx, db_cfg);
     spawn_writer(&rt, conn_net,  net_rx,  db_cfg);
     spawn_writer(&rt, conn_etw,  etw_rx,  db_cfg);
 
-    // background tasks
+    // Background DB‑maintenance tasks
     spawn_ttl_cleanup(&rt, db_path.clone(), db_cfg);
     spawn_wal_maintenance(&rt, db_path.clone(), db_cfg);
 
-    // Windows SCM
+    // ────────────────────────────────────────────────────────────────────
+    // 6 ▸ Windows SCM integration
+    // ────────────────────────────────────────────────────────────────────
     let (svc_tx, svc_rx) = mpsc::sync_channel(1);
     let status_handle = service_control_handler::register(
         SERVICE_NAME,
@@ -186,15 +191,21 @@ fn run_service() {
     };
     status_handle.set_service_status(status.clone()).unwrap();
 
-    // Scanner thread
+    // ────────────────────────────────────────────────────────────────────
+    // 7 ▸ Scanner thread
+    // ────────────────────────────────────────────────────────────────────
     status.current_state = ServiceState::Running;
     status_handle.set_service_status(status.clone()).unwrap();
-    let groups     = build_scanner_groups(&master);
+
+    let groups = cfg.scanner.clone(); // already runtime‑ready `RiskGroup`s
     log::info!("Service running with {} scanner groups", groups.len());
-    let cache_path = exe.join("persistent_cache.json");
+
+    let cache_path = exe_dir.join("persistent_cache.json");
     thread::spawn(move || run_scanner(groups, cache_path));
 
-    // Shutdown
+    // ────────────────────────────────────────────────────────────────────
+    // 8 ▸ Shutdown
+    // ────────────────────────────────────────────────────────────────────
     let _ = svc_rx.recv();
     log::warn!("Shutdown initiated");
     status.current_state = ServiceState::Stopped;
@@ -207,6 +218,7 @@ fn service_main(_args: Vec<OsString>) {
 }
 
 fn main() {
+    // When not launched by the SCM we fall back to console mode.
     if start(SERVICE_NAME, ffi_service_main).is_err() {
         eprintln!(
             "[{}][ERROR][main] Not a service; falling back to console.",

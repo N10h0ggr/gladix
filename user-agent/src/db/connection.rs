@@ -3,7 +3,7 @@
 
 use std::{fs, path::{Path, PathBuf}, time::Duration};
 use rusqlite::Connection;
-use crate::config::types::DatabaseConfig;
+use crate::config::model::DatabaseConfig;
 
 pub fn db_path(exe_dir: &Path, cfg: &DatabaseConfig) -> PathBuf {
     exe_dir.join(&cfg.path)

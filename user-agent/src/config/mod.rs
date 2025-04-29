@@ -1,6 +1,8 @@
-//! API pública de configuración.
+//! Public API for configuration
 
-pub mod types;
 pub mod loader;
+pub mod model;
 
-pub use loader::{load_master_config, convert_config_to_risk_group};
+// Re-export the main entrypoints:
+pub use loader::load;
+pub use model::Config;
