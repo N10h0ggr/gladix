@@ -39,4 +39,5 @@ tokio-stream = "0.1.17"
 futures = "0.3.31"
 async-trait = "0.1.88"
 tonic = { version = "0.13", features = ["transport"] }
+memmap2 = "0.9.5"
 

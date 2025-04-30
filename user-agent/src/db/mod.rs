@@ -6,28 +6,32 @@ pub mod maintenance;
 pub mod db_writer;
 pub mod batch_inserts;
 
+// src/db/mod.rs
+
 use rusqlite::Connection;
 use tokio::{runtime::Runtime, sync::mpsc as async_mpsc};
+
 use crate::config::model::DatabaseConfig;
-pub use db_writer::DbWriter;
-pub use batch_inserts::BatchInsert;
+use crate::db::db_writer::DbWriter;
+use crate::db::batch_inserts::BatchInsert;
 
-
-/// Spawn a dedicated writer task for events of type `E`.
-pub fn spawn_writer<E>(
+/// Arranca un writer de SQLite para cualquier `T` que implemente:
+///   - `BatchInsert<T>` (tiene el SQL y el bind_and_execute)
+///   - `Send + Clone + 'static` (para poder moverse al task de Tokio)
+pub fn spawn_writer<T>(
     rt: &Runtime,
     conn: Connection,
-    rx: async_mpsc::Receiver<E>,
+    rx: async_mpsc::Receiver<T>,
     cfg: &DatabaseConfig,
-) where
-    E: BatchInsert<E> + Send + 'static,
+)
+where
+    T: BatchInsert<T> + Send + Clone + 'static,
 {
-    // Copy what we need so nothing borrowed lives in the async task
-    let flush_ms  = cfg.flush_interval_ms;
-    let batch_sz  = cfg.batch_size;
+    let flush_ms = cfg.flush_interval_ms;
+    let batch_sz = cfg.batch_size;
 
     rt.spawn(async move {
-        DbWriter::<E> {
+        DbWriter::<T> {
             conn,
             rx,
             flush_interval_ms: flush_ms,
@@ -37,4 +41,3 @@ pub fn spawn_writer<E>(
             .await;
     });
 }
-

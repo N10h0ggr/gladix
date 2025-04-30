@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use metrics::{histogram, counter};
-use crate::db::batch_inserts::BatchInsert; // trae el trait extendido
+use crate::db::batch_inserts::BatchInsert; 
 
 /// A high-performance, batched writer for SQLite.
 /// Performs all DB work synchronously to avoid holding &Connection across .await.

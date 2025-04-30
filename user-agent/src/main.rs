@@ -31,8 +31,9 @@ use std::{
     thread,
     time::Duration,
 };
+use std::sync::Arc;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc as async_mpsc;
+use tokio::sync::{broadcast, mpsc as async_mpsc};
 use windows_service::{
     define_windows_service,
     service::{
@@ -43,8 +44,9 @@ use windows_service::{
     service_dispatcher::start,
 };
 
+use crate::comms::WrappedEvent;
 use crate::config::{load, Config};
-use comms::events::{EtwEvent, FileEvent, NetworkEvent};
+use shared::events::{ProcessEvent};
 use db::{
     connection::{init_database, open_db_connection},
     maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance},
@@ -52,6 +54,8 @@ use db::{
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use scanner::run_scanner;
+use crate::comms::listeners::{Buses, Listener, RingListener};
+use crate::comms::memory_ring::MemoryRing;
 
 const SERVICE_NAME: &str = "Gladix";
 
@@ -143,21 +147,36 @@ fn run_service() {
     let db_cfg  = &cfg.database;
     let db_path = db::connection::db_path(&exe_dir, db_cfg);
 
-    let conn_file = init_database(&exe_dir, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
-    let conn_net  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
-    let conn_etw  = open_db_connection(&db_path, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
+    let db_conn_process = init_database(&exe_dir, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
 
     // ────────────────────────────────────────────────────────────────────
     // 5 ▸ Tokio runtime & async DB writers
     // ────────────────────────────────────────────────────────────────────
     let rt = Runtime::new().expect("Tokio runtime failed");
-    let (_file_tx, file_rx) = async_mpsc::channel::<FileEvent>(10_000);
-    let (_net_tx,  net_rx ) = async_mpsc::channel::<NetworkEvent>(10_000);
-    let (_etw_tx,  etw_rx ) = async_mpsc::channel::<EtwEvent>(10_000);
+    let (process_db_tx, process_db_rx) =
+        async_mpsc::channel::<WrappedEvent<ProcessEvent>>(10_000);
+    spawn_writer(&rt, db_conn_process, process_db_rx, db_cfg);
 
-    spawn_writer(&rt, conn_file, file_rx, db_cfg);
-    spawn_writer(&rt, conn_net,  net_rx,  db_cfg);
-    spawn_writer(&rt, conn_etw,  etw_rx,  db_cfg);
+    // 5a ▸ MemoryRing listener para ProcessEvent
+    let process_ring = MemoryRing::open(r"\\Gladix\process_ring")
+        .unwrap_or_else(|e| fatal!("ring", "process_ring: {}", e));
+    let process_listener = Arc::new(RingListener::<ProcessEvent>::new(
+        "process",
+        process_ring,
+        "7119d098-3100-4fc2-ba48-52b1fabdb4b8",
+    ));
+
+    // Creamos también el canal de broadcast para intel
+    let (process_intel_tx, _) =
+        broadcast::channel::<WrappedEvent<ProcessEvent>>(1_024);
+
+    // Ahora sí conectamos los _mismos_ senders al Buses…
+    let process_buses = Buses {
+        db_tx:    process_db_tx.clone(),
+        intel_tx: process_intel_tx.clone(),
+    };
+
+    process_listener.spawn(process_buses);
 
     // Background DB‑maintenance tasks
     spawn_ttl_cleanup(&rt, db_path.clone(), db_cfg);

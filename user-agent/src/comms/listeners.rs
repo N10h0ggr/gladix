@@ -1,184 +1,136 @@
-//! Listener abstraction + concrete stubs (gRPC, ETW, ring‑buffer).
-//! -----------------------------------------------------------------------------
-//! A **listener** ingests raw telemetry from one protocol / source and hands it
-//! to a small **triage** task that forwards it to the global buses:
-//!   • `intel_tx.send(ev.clone())` → unbounded multicast for the detection
-//!     engine.
-//!   • `db_tx.try_send(ev)`       → bounded queue in front of the single DB
-//!     writer (loss‑tolerant).
-//!
-//! We keep one triage per listener so bursty sources cannot starve others.  This
-//! file only contains skeletons that *compile*; real decoding / gRPC plumbing
-//! will be added incrementally.
+// src/comms/listeners.rs
 
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::{broadcast, mpsc}, task, time};
+use std::{marker::PhantomData, sync::Arc, time::SystemTime};
 use async_trait::async_trait;
-use crossbeam::channel::Receiver as CbReceiver;
+use prost::Message;
+use tokio::{task, sync::{broadcast, mpsc}};
 
-use crate::comms::events::{Event, ProcessEvent};
+use super::{WrappedEvent, memory_ring::MemoryRing};
 
-// ============================================================================
-// 0 ▸ Global buses (intel + DB)
-// ============================================================================
-
-/// Shared send handles cloned into every triage task.
+/// Canales para enviar WrappedEvent<E> a base de datos e inteligencia.
+/// E: Clone + Send + 'static asegura que WrappedEvent<E> sea Clone + Send + 'static.
 #[derive(Clone)]
-pub struct Buses {
-    pub intel_tx: broadcast::Sender<Event>,
-    pub db_tx:    mpsc::Sender<Event>,
+pub struct Buses<E: Clone + Send + 'static> {
+    pub db_tx:    mpsc::Sender<WrappedEvent<E>>,
+    pub intel_tx: broadcast::Sender<WrappedEvent<E>>,
 }
 
-impl Buses {
-    pub fn new(db_capacity: usize, broadcast_capacity: usize) -> Self {
-        let (db_tx,  _) = mpsc::channel(db_capacity);
-        let (intel_tx, _) = broadcast::channel(broadcast_capacity);
-        Self { intel_tx, db_tx }
+impl<E: Clone + Send + 'static> Buses<E> {
+    pub fn new(db_capacity: usize, intel_capacity: usize) -> Self {
+        let (db_tx, _)    = mpsc::channel(db_capacity);
+        let (intel_tx, _) = broadcast::channel(intel_capacity);
+        Self { db_tx, intel_tx }
     }
 }
 
-// ============================================================================
-// 1 ▸ Listener trait – uniform way to spawn them
-// ============================================================================
-
+/// Trait genérico de listeners que producen WrappedEvent<E>.
+/// E: Clone + Send + 'static para que los canales y futures sean Send + 'static.
 #[async_trait]
-pub trait Listener: Send + Sync + 'static {
-    /// Display name for metrics / logs.
+pub trait Listener<E: Clone + Send + 'static>: Send + Sync + 'static {
+    /// Nombre para logs/metrics.
     fn name(&self) -> &'static str;
 
-    /// Capacity of the per‑listener raw queue.
+    /// Capacidad del canal interno “raw”.
     fn capacity(&self) -> usize { 16_384 }
 
-    /// Spawn the I/O loop that pulls data from the external source and pushes
-    /// `Event`s into the provided `tx`.
-    async fn ingest(self: Arc<Self>, tx: mpsc::Sender<Event>);
+    /// Lee del ring, decodifica E y envuelve en WrappedEvent<E>.
+    async fn ingest(self: Arc<Self>, tx: mpsc::Sender<WrappedEvent<E>>);
 
-    /// Optional triage step – default is pass‑through.
-    fn triage(&self, ev: Event) -> Option<Event> { Some(ev) }
+    /// Filtro/triage opcional (por defecto pasa todo).
+    fn triage(&self, ev: WrappedEvent<E>) -> Option<WrappedEvent<E>> {
+        Some(ev)
+    }
 
-    /// Convenience helper: launches *ingest* + *triage*.
-    fn spawn(self: Arc<Self>, buses: Buses) {
+    /// Helper que lanza ingest + triage → broadcast + db.
+    fn spawn(self: Arc<Self>, buses: Buses<E>) {
         let name = self.name();
         let cap  = self.capacity();
-
-        // Channel between ingest task and triage task.
-        let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(cap);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<WrappedEvent<E>>(cap);
         let ingest_self = self.clone();
         let triage_self = self;
+        let Buses { db_tx, intel_tx } = buses;
 
-        // ── Task 1: ingest (protocol‑specific) ────────────────────────────
+        // Tarea de ingest
         task::spawn(async move {
-            log::info!("listener '{name}' started");
+            log::info!("listener '{}' ingest started", name);
             ingest_self.ingest(raw_tx).await;
-            log::info!("listener '{name}' exited");
+            log::info!("listener '{}' ingest ended", name);
         });
 
-        // ── Task 2: triage & forward ─────────────────────────────────────
-        let Buses { intel_tx, db_tx } = buses;
+        // Tarea de triage + forward
         task::spawn(async move {
-            while let Some(mut ev) = raw_rx.recv().await {
+            log::info!("listener '{}' triage started", name);
+            while let Some(ev) = raw_rx.recv().await {
                 if let Some(ev2) = triage_self.triage(ev) {
-                    let _ = intel_tx.send(ev2.clone()); // never blocks
-                    let _ = db_tx.try_send(ev2);        // may drop if full
+                    // clonamos para intel; el original va a BD
+                    let _ = intel_tx.send(ev2.clone());
+                    let _ = db_tx.send(ev2).await;
                 }
             }
-            log::info!("triage for '{name}' terminated – chan closed");
+            log::info!("listener '{}' triage ended", name);
         });
     }
 }
 
-/// A listener that pulls `ProcessEvent` from a crossbeam channel (standing in
-/// for your real shared‐memory ring buffer) and forwards them as `Event::Process`.
-pub struct ProcessRingBufferListener {
-    rx: CbReceiver<ProcessEvent>,
+/// Listener que lee bytes de un MemoryRing, los decodifica con prost y envuelve.
+pub struct RingListener<E> {
+    name:        &'static str,
+    ring:        MemoryRing,
+    sensor_guid: String,
+    _marker:     PhantomData<E>,
 }
 
-impl ProcessRingBufferListener {
-    /// Build from the receiver end of your ring buffer
-    pub fn new(rx: CbReceiver<ProcessEvent>) -> Self {
-        Self { rx }
+impl<E> RingListener<E> {
+    /// `name`: p.ej. "network"; `ring`: tu MemoryRing; `sensor_guid`: desde config.
+    pub fn new(
+        name: &'static str,
+        ring: MemoryRing,
+        sensor_guid: impl Into<String>
+    ) -> Self {
+        Self {
+            name,
+            ring,
+            sensor_guid: sensor_guid.into(),
+            _marker: PhantomData,
+        }
     }
 }
 
 #[async_trait]
-impl Listener for ProcessRingBufferListener {
+impl<E> Listener<E> for RingListener<E>
+where
+// E debe decodificarse con prost, clonarse, enviarse entre hilos y vivir 'static
+    E: Message + Default + Clone + Send + Sync + 'static,
+{
     fn name(&self) -> &'static str {
-        "process_ring_buffer"
+        self.name
     }
 
-    async fn ingest(self: Arc<Self>, tx: mpsc::Sender<Event>) {
-        // Offload the blocking recv loop to a dedicated OS thread
-        let rx = self.rx.clone();
-        task::spawn_blocking(move || {
-            while let Ok(pe) = rx.recv() {
-                let ev = Event::Process(pe);
-                // blocking_send() will block _this_ thread only, never a Tokio worker
-                if tx.blocking_send(ev).is_err() {
-                    // downstream dropped → exit
+    async fn ingest(self: Arc<Self>, tx: mpsc::Sender<WrappedEvent<E>>) {
+        loop {
+            match self.ring.pop().await {
+                Some(bytes) => match E::decode(&*bytes) {
+                    Ok(payload) => {
+                        let wrapped = WrappedEvent {
+                            // SystemTime::now() se convierte a prost_types::Timestamp
+                            ts:          SystemTime::now().into(),
+                            sensor_guid: self.sensor_guid.clone(),
+                            payload,
+                        };
+                        if tx.send(wrapped).await.is_err() {
+                            // receptor cerrado → salimos
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("listener '{}': decode error: {:?}", self.name, err);
+                    }
+                },
+                None => {
+                    // buffer cerrado
                     break;
                 }
             }
-        })
-            .await
-            .expect("process ring ingest task panicked");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::comms::listeners::Buses;
-    use crate::comms::events::Event;
-    use chrono::Utc;
-    use crossbeam::channel::unbounded;
-    use tokio::sync::{broadcast, mpsc};
-
-    #[tokio::test]
-    async fn test_process_ring_listener() {
-        // 1) prepare a fake ring-buffer (crossbeam channel) and two events
-        let (rb_tx, rb_rx) = unbounded();
-        let pe1 = ProcessEvent {
-            ts: Utc::now(),
-            sensor_guid: "sensor-A".into(),
-            pid: 42,
-            ppid: 1,
-            image_path: "/usr/bin/foo".into(),
-            cmdline: "--foo".into(),
-        };
-        let pe2 = ProcessEvent {
-            ts: Utc::now(),
-            sensor_guid: "sensor-B".into(),
-            pid: 99,
-            ppid: 42,
-            image_path: "/usr/bin/bar".into(),
-            cmdline: "--bar".into(),
-        };
-
-        // 2) build listener + buses
-        let listener = Arc::new(ProcessRingBufferListener::new(rb_rx));
-        let (db_tx, _db_rx) = mpsc::channel::<Event>(8);
-        let (intel_tx, mut intel_rx) = broadcast::channel::<Event>(8);
-        let buses = Buses { intel_tx: intel_tx.clone(), db_tx };
-
-        // 3) spawn the two tasks (ingest + triage)
-        listener.spawn(buses);
-
-        // 4) push into the “ring buffer”
-        rb_tx.send(pe1.clone()).unwrap();
-        rb_tx.send(pe2.clone()).unwrap();
-
-        // 5) give the background tasks a moment
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // 6) assert we saw both on the intel channel
-        let mut got = Vec::new();
-        for _ in 0..2 {
-            if let Ok(Event::Process(pe)) = intel_rx.recv().await {
-                got.push(pe);
-            }
         }
-        assert_eq!(got.len(), 2);
-        assert!(got.contains(&pe1));
-        assert!(got.contains(&pe2));
     }
 }
