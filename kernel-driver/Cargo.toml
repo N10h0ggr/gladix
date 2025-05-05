@@ -1,8 +1,8 @@
 [package]
-edition = "2021"
-name = "my-first-wdm-driver"
+edition = "2024"
+name = "gladix-driver"
 version = "0.0.0"
-description = "A sample WDM driver that demonstrates WDM in RUST"
+description = "Security Detection WDM driver for Gladix project"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["windows", "driver", "sample", "example", "wdm"]
@@ -17,13 +17,18 @@ crate-type = ["cdylib"]
 test = false
 
 [build-dependencies]
-wdk-build = { path = "../../ext-crates/windows-drivers-rs-main/crates/wdk-build", version = "0.3.0" }
+wdk-build = { path = "C:\\Users\\MALDEV01\\Desktop\\my-code\\drivers\\ext-crates\\windows-drivers-rs-main\\crates\\wdk-build", version = "0.3.0" }
 
 [dependencies]
-wdk = { path = "../../ext-crates/windows-drivers-rs-main/crates/wdk", version = "0.3.0" }
-wdk-alloc = { path = "../../ext-crates/windows-drivers-rs-main/crates/wdk-alloc", version = "0.3.0" }
-wdk-panic = { path = "../../ext-crates/windows-drivers-rs-main/crates/wdk-panic", version = "0.3.0" }
-wdk-sys = { path = "../../ext-crates/windows-drivers-rs-main/crates/wdk-sys",  version = "0.3.0" }
+wdk = { path = "C:\\Users\\MALDEV01\\Desktop\\my-code\\drivers\\ext-crates\\windows-drivers-rs-main\\crates\\wdk", version = "0.3.0" }
+wdk-alloc = { path = "C:\\Users\\MALDEV01\\Desktop\\my-code\\drivers\\ext-crates\\windows-drivers-rs-main\\crates\\/wdk-alloc", version = "0.3.0" }
+wdk-panic = { path = "C:\\Users\\MALDEV01\\Desktop\\my-code\\drivers\\ext-crates\\windows-drivers-rs-main\\crates\\wdk-panic", version = "0.3.0" }
+wdk-sys = { path = "C:\\Users\\MALDEV01\\Desktop\\my-code\\drivers\\ext-crates\\windows-drivers-rs-main\\crates\\wdk-sys",  version = "0.3.0" }
+prost = "0.13.5"
+
+[dependencies.shared]
+path = "../shared"
+default-features = false
 
 [features]
 default = []

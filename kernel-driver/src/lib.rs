@@ -1,74 +1,138 @@
-//! Entry point and initialization for the EDR kernel-mode driver.
-//!
-//! This file defines the entry point (`DriverEntry`) and unload routine for the
-//! kernel driver. It is responsible for setting up global state, initializing
-//! kernel-mode subsystems (e.g., minifilters, WFP callouts, callbacks), and
-//! providing clean teardown during driver unload.
-//!
-//! Key responsibilities:
-//! - Serve as the central integration point for all driver components.
-//! - Call initialization routines for subsystems.
-//! - Handle global registration (minifilter, WFP, callbacks).
-//! - Ensure orderly shutdown and resource release on unload.
-//!
-//! This file is compiled with `#![no_std]` and assumes proper configuration for
-//! Windows kernel-mode development.
-
 #![no_std]
 extern crate alloc;
 
 #[cfg(not(test))]
 extern crate wdk_panic;
 
-use alloc::{ffi::CString, slice, string::String};
+use alloc::{ffi::CString, string::String, vec::Vec};
+use core::slice;
 
 use wdk::println;
-#[cfg(not(test))]
+use wdk_sys::{
+    DRIVER_OBJECT,
+    PCUNICODE_STRING,
+    PS_CREATE_NOTIFY_INFO,
+    PEPROCESS,
+    UNICODE_STRING,
+    STATUS_SUCCESS,
+    NTSTATUS,
+    HANDLE,
+    ntddk::{PsSetCreateProcessNotifyRoutineEx, DbgPrint, PsGetProcessId},
+};
 use wdk_alloc::WdkAllocator;
-use wdk_sys::{ntddk::DbgPrint, DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, STATUS_SUCCESS};
+
+use prost::Message;
+use shared::events::ProcessEvent;
+
+mod communications;
+use communications::memory_ring::MemoryRing;
+
+static mut SHARED_RING: Option<MemoryRing> = None;
+
+/// Callback: serializa el evento y lo escribe en el ring.
+unsafe extern "C" fn process_notify_ring(
+    parent: PEPROCESS,
+    process: PEPROCESS,
+    info_ptr: *mut PS_CREATE_NOTIFY_INFO,
+) {
+    if info_ptr.is_null() {
+        return;
+    }
+    let info = &*info_ptr;
+
+    // Obtenemos PID y PPID con PsGetProcessId
+    let pid  = PsGetProcessId(process) as u32;
+    let ppid = PsGetProcessId(parent)  as u32;
+
+    // Convierte UNICODE_STRING a Rust String
+    fn uni_to_string(us: &UNICODE_STRING) -> String {
+        let len = (us.Length / 2) as usize;
+        let buf = unsafe { slice::from_raw_parts(us.Buffer, len) };
+        String::from_utf16_lossy(buf)
+    }
+
+    let image_path = if !info.ImageFileName.is_null() {
+        uni_to_string(&*info.ImageFileName)
+    } else {
+        String::new()
+    };
+    let cmdline = if !info.CommandLine.is_null() {
+        uni_to_string(&*info.CommandLine)
+    } else {
+        String::new()
+    };
+
+    // Serializamos el mensaje protobuf
+    let evt = ProcessEvent { pid, ppid, image_path, cmdline };
+    let mut buf: Vec<u8> = Vec::with_capacity(evt.encoded_len());
+    if evt.encode(&mut buf).is_err() {
+        return;
+    }
+
+    // Lo empujamos al ring
+    if let Some(ring) = SHARED_RING.as_ref() {
+        ring.push_bytes(&buf);
+    }
+}
 
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
-/// `driver_entry` function required by WDM
-///
-/// # Panics
-/// Can panic from unwraps of `CStrings` used internally
-///
-/// # Safety
-/// Function is unsafe since it dereferences raw pointers passed to it from WDM
-#[export_name = "DriverEntry"]
-pub unsafe extern "system" fn driver_entry(
+#[unsafe(export_name = "DriverEntry")]
+pub unsafe extern "C" fn driver_entry(
     driver: &mut DRIVER_OBJECT,
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
-    // This is an example of directly using DbgPrint binding to print
-    let string = CString::new("Hello World!\n").unwrap();
-    unsafe {
-        DbgPrint(string.as_ptr());
-    }
+    // Debug print
+    let banner = CString::new("EDR Driver Loading...\n").unwrap();
+    DbgPrint(banner.as_ptr());
 
+    // Unload handler
     driver.DriverUnload = Some(driver_exit);
 
-    // Translate UTF16 string to rust string
-    let registry_path: String = String::from_utf16_lossy(unsafe {
-        slice::from_raw_parts(
-            (*registry_path).Buffer,
-            (*registry_path).Length as usize / core::mem::size_of_val(&(*(*registry_path).Buffer)),
-        )
-    });
+    // 1) Crear y mapear ring (64 KiB)
+    match MemoryRing::create(r"Global\MySharedSection", 64 * 1024) {
+        Ok(mut ring) => {
+            if let Err(e) = ring.map() {
+                println!("Error mapeando ring: 0x{:X}", e);
+                return e;
+            }
+            SHARED_RING = Some(ring);
+        }
+        Err(e) => {
+            println!("Error creando ring: 0x{:X}", e);
+            return e;
+        }
+    }
 
-    // It is much better to use the println macro that has an implementation in
-    // wdk::print.rs to call DbgPrint. The println! implementation in
-    // wdk::print.rs has the same features as the one in std (ex. format args
-    // support).
-    println!("WDM Driver Entry Complete! Driver Registry Parameter Key: {registry_path}");
+    // 2) Registrar callback de creación de procesos
+    let status = PsSetCreateProcessNotifyRoutineEx(Some(process_notify_ring), false);
+    if status != STATUS_SUCCESS {
+        println!("Falló registro de notify: 0x{:X}", status);
+        return status;
+    }
+
+    // 3) Debug: imprimimos la ruta del registry
+    let reg = {
+        let us = &*registry_path;
+        let sl = slice::from_raw_parts(us.Buffer, (us.Length / 2) as usize);
+        String::from_utf16_lossy(sl)
+    };
+    println!("EDR Driver listo. Registry Path: {}", reg);
 
     STATUS_SUCCESS
 }
 
 extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
-    println!("Goodbye World!");
-    println!("Driver Exit Complete!");
+    println!("EDR Driver Unloading...");
+
+    unsafe {
+        // Removemos callback
+        let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify_ring), true);
+        // Al asignar None, se invoca Drop en MemoryRing (unmap + close)
+        SHARED_RING = None;
+    }
+
+    println!("EDR Driver Unloaded.");
 }

@@ -7,9 +7,12 @@
       <sourceFolder url="file://$MODULE_DIR$/shared/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/user-agent/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/user-agent/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/kernel-driver/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/kernel-driver/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/desktop-app/src-tauri/target" />
       <excludeFolder url="file://$MODULE_DIR$/shared/target" />
       <excludeFolder url="file://$MODULE_DIR$/user-agent/target" />
+      <excludeFolder url="file://$MODULE_DIR$/kernel-driver/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

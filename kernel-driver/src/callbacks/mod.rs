@@ -9,3 +9,4 @@
 //! - Register object access callbacks using `ObRegisterCallbacks`.
 //! - Forward relevant events to the user-agent for policy enforcement.
 //! - Deregister callbacks on driver unload.
+pub mod psnotify;

@@ -5,3 +5,5 @@ pub mod events {
 pub mod config {
     include!("proto_gen/config.rs"); // or mod per file
 }
+
+pub mod constants;
