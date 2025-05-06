@@ -1,15 +1,12 @@
-// src/communications/memory_ring.rs
 #![no_std]
 extern crate alloc;
 
 use alloc::vec::Vec;
 use core::{
-    ffi::c_void,
-    iter::once,
-    ptr,
+    ffi::c_void, iter::once, ptr,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use wdk_sys::{STATUS_SUCCESS, NTSTATUS, HANDLE};
+use wdk_sys::{NTSTATUS, STATUS_SUCCESS, HANDLE};
 use wdk_sys::ntddk::{
     InitializeObjectAttributes, NtCurrentProcess, RtlInitUnicodeString,
     ZwClose, ZwCreateSection, ZwDuplicateObject, ZwMapViewOfSection, ZwUnmapViewOfSection,
@@ -17,7 +14,11 @@ use wdk_sys::ntddk::{
     PAGE_READWRITE, UNICODE_STRING, OBJECT_ATTRIBUTES,
 };
 
-/// Un simple ring buffer en una sección nombrada para compartir con user-mode.
+/// Public constants so the driver & user agent agree ---------------------------
+pub const RING_NAME: &str   = r"Global\MySharedSection";
+pub const RING_SIZE: usize  = 64 * 1024;
+
+/// Very small, SPSC ring – length‑unaware (the writer wraps when space ends)
 pub struct MemoryRing {
     section_handle: HANDLE,
     size: usize,
@@ -26,116 +27,65 @@ pub struct MemoryRing {
 }
 
 impl MemoryRing {
-    /// Crea la sección nombrada de `size` bytes.
+    /// Create the named section
     pub fn create(name: &str, size: usize) -> Result<Self, NTSTATUS> {
-        // UTF-16 + terminador
+        // build UNICODE_STRING
         let mut u_name = UNICODE_STRING::default();
         let wide: Vec<u16> = name.encode_utf16().chain(once(0)).collect();
         unsafe { RtlInitUnicodeString(&mut u_name, wide.as_ptr()) };
 
-        // OBJECT_ATTRIBUTES con OBJ_KERNEL_HANDLE
-        let mut obj_attrs = OBJECT_ATTRIBUTES::default();
-        unsafe {
-            InitializeObjectAttributes(
-                &mut obj_attrs,
-                &mut u_name,
-                OBJ_KERNEL_HANDLE,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
-        }
+        // OBJ_KERNEL_HANDLE attrs
+        let mut attrs = OBJECT_ATTRIBUTES::default();
+        unsafe { InitializeObjectAttributes(&mut attrs, &mut u_name,
+                                            OBJ_KERNEL_HANDLE, ptr::null_mut(), ptr::null_mut()) };
 
-        // ZwCreateSection
-        let mut section_handle: HANDLE = ptr::null_mut();
-        let mut max_size = size as i64;
-        let status = unsafe {
-            ZwCreateSection(
-                &mut section_handle,
-                SECTION_ALL_ACCESS,
-                &mut obj_attrs,
-                &mut max_size,
-                PAGE_READWRITE,
-                SEC_COMMIT,
-                ptr::null_mut(),
-            )
+        // section
+        let mut handle: HANDLE = ptr::null_mut();
+        let mut max = size as i64;
+        let st = unsafe {
+            ZwCreateSection(&mut handle, SECTION_ALL_ACCESS, &mut attrs,
+                            &mut max, PAGE_READWRITE, SEC_COMMIT, ptr::null_mut())
         };
-        if status != STATUS_SUCCESS {
-            return Err(status);
-        }
+        if st != STATUS_SUCCESS { return Err(st) }
 
         Ok(Self {
-            section_handle,
+            section_handle: handle,
             size,
             base: ptr::null_mut(),
             write_offset: AtomicUsize::new(0),
         })
     }
 
-    /// Mapea la sección en kernel-space para poder escribir.
+    /// Map into kernel space so we can write
     pub fn map(&mut self) -> Result<(), NTSTATUS> {
-        let mut base_ptr: *mut c_void = ptr::null_mut();
-        let mut view_size = self.size;
-        let status = unsafe {
-            ZwMapViewOfSection(
-                self.section_handle,
-                NtCurrentProcess(),
-                &mut base_ptr,
-                0,
-                0,
-                ptr::null_mut(),
-                &mut view_size,
-                SECTION_INHERIT_VIEW_SHARE,
-                0,
-                PAGE_READWRITE,
-            )
+        let mut base: *mut c_void = ptr::null_mut();
+        let mut view = self.size;
+        let st = unsafe {
+            ZwMapViewOfSection(self.section_handle, NtCurrentProcess(), &mut base,
+                               0, 0, ptr::null_mut(), &mut view,
+                               SECTION_INHERIT_VIEW_SHARE, 0, PAGE_READWRITE)
         };
-        if status != STATUS_SUCCESS {
-            return Err(status);
-        }
-        self.base = base_ptr as *mut u8;
+        if st != STATUS_SUCCESS { return Err(st) }
+        self.base = base as *mut u8;
         Ok(())
     }
 
-    /// Duplica el handle para pasárselo a user-mode.
-    pub fn dup_for_user(&self, target_process: HANDLE, options: u32) -> Result<HANDLE, NTSTATUS> {
+    #[allow(dead_code)]
+    pub fn dup_for_user(&self, target: HANDLE, opts: u32) -> Result<HANDLE, NTSTATUS> {
         let mut dup: HANDLE = ptr::null_mut();
-        let status = unsafe {
-            ZwDuplicateObject(
-                NtCurrentProcess(),
-                self.section_handle,
-                target_process,
-                &mut dup,
-                SECTION_ALL_ACCESS,
-                0,
-                options,
-            )
+        let st = unsafe {
+            ZwDuplicateObject(NtCurrentProcess(), self.section_handle,
+                              target, &mut dup, SECTION_ALL_ACCESS, 0, opts)
         };
-        if status != STATUS_SUCCESS {
-            return Err(status);
-        }
-        Ok(dup)
+        if st == STATUS_SUCCESS { Ok(dup) } else { Err(st) }
     }
 
-    /// Puntero base de la región mapeada.
-    pub fn base_ptr(&self) -> *mut u8 {
-        self.base
-    }
-
-    /// Capacidad total en bytes.
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Escribe `buf` en el ring, envolviendo al llegar al final.
+    /// Very simple write – wraps at end of buffer, no length prefix
     pub fn push_bytes(&self, buf: &[u8]) {
-        let cap = self.size();
+        let cap = self.size;
         let mut off = self.write_offset.load(Ordering::Relaxed);
-        if off + buf.len() > cap {
-            off = 0;
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(buf.as_ptr(), self.base.add(off), buf.len());
-        }
+        if off + buf.len() > cap { off = 0; }
+        unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), self.base.add(off), buf.len()); }
         self.write_offset.store(off + buf.len(), Ordering::Relaxed);
     }
 }
@@ -143,12 +93,8 @@ impl MemoryRing {
 impl Drop for MemoryRing {
     fn drop(&mut self) {
         if !self.base.is_null() {
-            unsafe {
-                ZwUnmapViewOfSection(NtCurrentProcess(), self.base as *mut c_void);
-            }
+            unsafe { ZwUnmapViewOfSection(NtCurrentProcess(), self.base as *mut c_void); }
         }
-        unsafe {
-            ZwClose(self.section_handle);
-        }
+        unsafe { ZwClose(self.section_handle); }
     }
 }

@@ -5,7 +5,7 @@ pub struct BaseEvent {
     pub ts: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(string, tag = "2")]
     pub sensor_guid: ::prost::alloc::string::String,
-    #[prost(oneof = "base_event::Payload", tags = "10, 11, 12, 13, 14")]
+    #[prost(oneof = "base_event::Payload", tags = "10, 11, 12, 13, 14, 15, 16")]
     pub payload: ::core::option::Option<base_event::Payload>,
 }
 /// Nested message and enum types in `BaseEvent`.
@@ -22,6 +22,10 @@ pub mod base_event {
         ScanResult(super::ScanResult),
         #[prost(message, tag = "14")]
         EtwEvent(super::EtwEvent),
+        #[prost(message, tag = "15")]
+        ImageLoadEvent(super::ImageLoadEvent),
+        #[prost(message, tag = "16")]
+        ObjectOpEvent(super::ObjectOpEvent),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -231,4 +235,24 @@ pub struct EtwEvent {
     pub tid: u32,
     #[prost(string, tag = "6")]
     pub json_payload: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImageLoadEvent {
+    #[prost(uint32, tag = "1")]
+    pub pid: u32,
+    #[prost(string, tag = "2")]
+    pub image_path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub image_base: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObjectOpEvent {
+    #[prost(uint32, tag = "1")]
+    pub pid: u32,
+    #[prost(string, tag = "2")]
+    pub target: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub operation: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub success: bool,
 }

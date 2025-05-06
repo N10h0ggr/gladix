@@ -40,4 +40,8 @@ futures = "0.3.31"
 async-trait = "0.1.88"
 tonic = { version = "0.13", features = ["transport"] }
 memmap2 = "0.9.5"
+windows-sys = { version = "0.59.0", features = [
+    "Win32_Foundation",      # for HANDLE, CloseHandle
+    "Win32_System_Memory"    # for OpenFileMappingW, MapViewOfFile, etc.
+] }
 

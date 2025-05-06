@@ -1,101 +1,124 @@
-// callbacks/psnotify.rs
-//! Process creation notification handler.
-//!
-//! This module focuses on intercepting process creation events to extract
-//! metadata (PID, parent PID, image path, etc.) for correlation and
-//! monitoring purposes. It enables early detection of suspicious process trees.
+//! Process‑creation notify → BaseEvent encoder
+#![no_std]
 
-use core::{ffi::c_void, mem::size_of};
-use alloc::string::String;
-use wdk_sys::ntddk::{PS_CREATE_NOTIFY_INFO, PEPROCESS, PsSetCreateProcessNotifyRoutineEx, PsRemoveCreateProcessNotifyRoutineEx, KeQuerySystemTimePrecise, };
-use wdk_sys::{HANDLE, LARGE_INTEGER, FilterSendMessage};
+extern crate alloc;
 
+use alloc::{string::String, vec::Vec};
+use core::{ptr, slice};
 
-// Import or bind FilterSendMessage from your communication driver/interface
-unsafe extern "system" {
-    fn FilterSendMessage(
-        communication_port: HANDLE,
-        buffer: *mut c_void,
-        buffer_size: u32,
-        reply_buffer: *mut c_void,
-        reply_buffer_size: u32,
-        return_status: *mut u32,
-    ) -> u32;
-}
+use prost::Message;
+use prost_types::Timestamp;
+use shared::events::{base_event, BaseEvent, ProcessEvent};
+use wdk_sys::{
+    LARGE_INTEGER, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
+    ntddk::{
+        KE_QUERY_SYSTEM_TIME_PRECISE_NAME, PS_CREATE_NOTIFY_INFO, PEPROCESS,
+        KeQuerySystemTimePrecise, PsGetProcessId, PsSetCreateProcessNotifyRoutineEx,
+        PsRemoveCreateProcessNotifyRoutineEx,
+    },
+};
 
-/// Basic process event structure sent to user space
-#[repr(C)]
-pub struct ProcessEvent {
-    pid: u32,
-    ppid: u32,
-    image_path: [u16; 260], // UNICODE_STRING buffer
-    ts: LARGE_INTEGER,
-}
+use crate::communications::memory_ring::MemoryRing;
 
-static mut COMM_PORT: HANDLE = core::ptr::null_mut();
+/*---------------------------------------------------------------------------*/
+/*  Public constants                                                          */
+/*---------------------------------------------------------------------------*/
 
-/// Register the process creation notify callback
-pub fn register() -> Result<(), NTSTATUS> {
-    // Optionally, establish communication port before callback
-    // COMM_PORT = setup_filter_port()?;
+/// Hard‑coded sensor GUID; swap for registry/IoCtl configuration if needed.
+const SENSOR_GUID: &str = "00000000‑0000‑0000‑0000‑000000000000";
 
-    let status = unsafe { PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 0) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(status)
+/*---------------------------------------------------------------------------*/
+/*  Private globals                                                           */
+/*---------------------------------------------------------------------------*/
+
+/// Raw pointer to the MemoryRing supplied by the driver
+static mut RING: *const MemoryRing = ptr::null();
+
+/*---------------------------------------------------------------------------*/
+/*  Registration helpers                                                      */
+/*---------------------------------------------------------------------------*/
+
+pub fn register(ring: &'static MemoryRing) -> Result<(), NTSTATUS> {
+    unsafe {
+        RING = ring as *const _;
+        let st = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), /*Remove=*/false);
+        if st == STATUS_SUCCESS { Ok(()) } else { Err(st) }
     }
 }
 
-/// Unregister the process creation notify callback
 pub unsafe fn unregister() -> Result<(), NTSTATUS> {
-    let status = PsRemoveCreateProcessNotifyRoutineEx(Some(process_notify));
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(status)
-    }
+    let st = PsRemoveCreateProcessNotifyRoutineEx(Some(process_notify));
+    if st == STATUS_SUCCESS { Ok(()) } else { Err(st) }
 }
 
-/// Callback for process create/exit notifications
+/*---------------------------------------------------------------------------*/
+/*  Utility functions                                                         */
+/*---------------------------------------------------------------------------*/
+
+/// Convert `UNICODE_STRING*` → `String`
+unsafe fn uni_to_string(uni: *const UNICODE_STRING) -> String {
+    if uni.is_null() {
+        return String::new();
+    }
+    let u = &*uni;
+    let len = (u.Length / 2) as usize;
+    let buf = slice::from_raw_parts(u.Buffer, len);
+    String::from_utf16_lossy(buf)
+}
+
+/// Convert Windows `LARGE_INTEGER` (100 ns since 1601‑01‑01) to Unix `Timestamp`
+fn li_to_timestamp(li: LARGE_INTEGER) -> Timestamp {
+    // 100 ns → seconds / nanos
+    let ticks = li.QuadPart as i64;
+    const WINDOWS_TO_UNIX_SECS: i64 = 11_644_473_600; // seconds between 1601‑01‑01 & 1970‑01‑01
+    let secs  = (ticks / 10_000_000) - WINDOWS_TO_UNIX_SECS;
+    let nanos = ((ticks % 10_000_000) * 100) as i32;
+    Timestamp { seconds: secs, nanos }
+}
+
+/*---------------------------------------------------------------------------*/
+/*  Actual callback                                                           */
+/*---------------------------------------------------------------------------*/
+
 unsafe extern "C" fn process_notify(
     parent: PEPROCESS,
     process: PEPROCESS,
-    create_info: *mut PS_CREATE_NOTIFY_INFO,
+    info_ptr: *mut PS_CREATE_NOTIFY_INFO,
 ) {
-    // Only handle creation events
-    if create_info.is_null() {
+    // Exit events have NULL info_ptr
+    if info_ptr.is_null() {
         return;
     }
-    let info = &*create_info;
 
-    // Prepare event structure
-    let mut event = ProcessEvent {
-        pid: wdk_sys::ntdef::HANDLE(process as isize) as u32,
-        ppid: wdk_sys::ntdef::HANDLE(parent as isize) as u32,
-        image_path: [0u16; 260],
-        ts: LARGE_INTEGER { QuadPart: 0 },
-    };
+    /*----------------------------- gather fields ----------------------------*/
+    let pid  = PsGetProcessId(process) as u32;
+    let ppid = PsGetProcessId(parent)  as u32;
+
+    let info       = &*info_ptr;
+    let image_path = uni_to_string(info.ImageFileName);
+    let cmdline    = uni_to_string(info.CommandLine);
 
     // Timestamp
-    KeQuerySystemTimePrecise(&mut event.ts);
+    let mut li = LARGE_INTEGER { QuadPart: 0 };
+    KeQuerySystemTimePrecise(&mut li);
+    let ts = li_to_timestamp(li);
 
-    // Extract image path (if available)
-    if !info.ImageFileName.is_null() {
-        let uni = &*info.ImageFileName;
-        let len = uni.Length as usize / 2;
-        let src = core::slice::from_raw_parts(uni.Buffer, len);
-        event.image_path[..len].copy_from_slice(src);
+    /*----------------------------- build messages ---------------------------*/
+    let proc_evt = ProcessEvent { pid, ppid, image_path, cmdline };
+    let base_evt = BaseEvent {
+        ts: Some(ts),
+        sensor_guid: SENSOR_GUID.into(),
+        payload: Some(base_event::Payload::ProcessEvent(proc_evt)),
+    };
+
+    /*----------------------------- serialise & push -------------------------*/
+    let mut buf = Vec::<u8>::with_capacity(base_evt.encoded_len());
+    if base_evt.encode(&mut buf).is_err() {
+        return; // encoding failed → drop event
     }
 
-    // Send to user mode via filter port
-    let mut ret_status: u32 = 0;
-    let _ = FilterSendMessage(
-        COMM_PORT,
-        &mut event as *mut _ as *mut c_void,
-        size_of::<ProcessEvent>() as u32,
-        core::ptr::null_mut(),
-        0,
-        &mut ret_status,
-    );
+    let ring = RING;
+    if !ring.is_null() {
+        (*ring).push_bytes(&buf);
+    }
 }

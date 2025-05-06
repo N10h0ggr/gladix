@@ -5,14 +5,17 @@ package events;
 import "google/protobuf/timestamp.proto";
 
 message BaseEvent {
-  google.protobuf.Timestamp ts = 1;
-  string sensor_guid   = 2;
+  google.protobuf.Timestamp ts      = 1;
+  string sensor_guid                = 2;
+
   oneof payload {
-    FileEvent      file_event      = 10;
-    NetworkEvent   network_event   = 11;
-    ProcessEvent   process_event   = 12;
-    ScanResult     scan_result     = 13;
-    EtwEvent       etw_event       = 14;
+    FileEvent       file_event       = 10;
+    NetworkEvent    network_event    = 11;
+    ProcessEvent    process_event    = 12;
+    ScanResult      scan_result      = 13;
+    EtwEvent        etw_event        = 14;
+    ImageLoadEvent  image_load_event = 15;
+    ObjectOpEvent   object_op_event  = 16;
   }
 }
 
@@ -64,4 +67,17 @@ message EtwEvent {
   uint32 pid           = 4;
   uint32 tid           = 5;
   string json_payload  = 6;
+}
+
+message ImageLoadEvent {
+  uint32 pid        = 1;
+  string image_path = 2;
+  uint64 image_base = 3;
+}
+
+message ObjectOpEvent {
+  uint32 pid       = 1;
+  string target    = 2;
+  string operation = 3;
+  bool success     = 4;
 }

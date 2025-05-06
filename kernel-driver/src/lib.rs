@@ -1,138 +1,93 @@
 #![no_std]
-extern crate alloc;
 
+extern crate alloc;
 #[cfg(not(test))]
 extern crate wdk_panic;
 
-use alloc::{ffi::CString, string::String, vec::Vec};
-use core::slice;
-
+use alloc::ffi::CString;
+use core::{ptr, slice};
+use core::sync::atomic::{AtomicPtr, Ordering};
 use wdk::println;
-use wdk_sys::{
-    DRIVER_OBJECT,
-    PCUNICODE_STRING,
-    PS_CREATE_NOTIFY_INFO,
-    PEPROCESS,
-    UNICODE_STRING,
-    STATUS_SUCCESS,
-    NTSTATUS,
-    HANDLE,
-    ntddk::{PsSetCreateProcessNotifyRoutineEx, DbgPrint, PsGetProcessId},
-};
 use wdk_alloc::WdkAllocator;
-
-use prost::Message;
-use shared::events::ProcessEvent;
+use wdk_sys::{
+    DRIVER_OBJECT, PCUNICODE_STRING, NTSTATUS, STATUS_SUCCESS,
+    ntddk::DbgPrint,
+};
 
 mod communications;
-use communications::memory_ring::MemoryRing;
+mod callbacks;
 
-static mut SHARED_RING: Option<MemoryRing> = None;
+use communications::memory_ring::{MemoryRing, RING_NAME, RING_SIZE};
+use callbacks::psnotify;
 
-/// Callback: serializa el evento y lo escribe en el ring.
-unsafe extern "C" fn process_notify_ring(
-    parent: PEPROCESS,
-    process: PEPROCESS,
-    info_ptr: *mut PS_CREATE_NOTIFY_INFO,
-) {
-    if info_ptr.is_null() {
-        return;
-    }
-    let info = &*info_ptr;
+/// Global pointer to the ring (leaked Box so it lives for the whole driver life‑time)
+static RING_PTR: AtomicPtr<MemoryRing> = AtomicPtr::new(ptr::null_mut());
 
-    // Obtenemos PID y PPID con PsGetProcessId
-    let pid  = PsGetProcessId(process) as u32;
-    let ppid = PsGetProcessId(parent)  as u32;
-
-    // Convierte UNICODE_STRING a Rust String
-    fn uni_to_string(us: &UNICODE_STRING) -> String {
-        let len = (us.Length / 2) as usize;
-        let buf = unsafe { slice::from_raw_parts(us.Buffer, len) };
-        String::from_utf16_lossy(buf)
-    }
-
-    let image_path = if !info.ImageFileName.is_null() {
-        uni_to_string(&*info.ImageFileName)
-    } else {
-        String::new()
-    };
-    let cmdline = if !info.CommandLine.is_null() {
-        uni_to_string(&*info.CommandLine)
-    } else {
-        String::new()
-    };
-
-    // Serializamos el mensaje protobuf
-    let evt = ProcessEvent { pid, ppid, image_path, cmdline };
-    let mut buf: Vec<u8> = Vec::with_capacity(evt.encoded_len());
-    if evt.encode(&mut buf).is_err() {
-        return;
-    }
-
-    // Lo empujamos al ring
-    if let Some(ring) = SHARED_RING.as_ref() {
-        ring.push_bytes(&buf);
-    }
+/// Helper used by the callback module to get the ring
+pub fn ring() -> Option<&'static MemoryRing> {
+    let p = RING_PTR.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(unsafe { &*p }) }
 }
 
 #[cfg(not(test))]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
+static GLOBAL: WdkAllocator = WdkAllocator;
 
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "C" fn driver_entry(
     driver: &mut DRIVER_OBJECT,
     registry_path: PCUNICODE_STRING,
-) -> NTSTATUS {
-    // Debug print
-    let banner = CString::new("EDR Driver Loading...\n").unwrap();
-    DbgPrint(banner.as_ptr());
-
-    // Unload handler
+) -> NTSTATUS
+{
+    // -------------------------------------------------------------------- banner
+    DbgPrint(CString::new("EDR driver loading…\n").unwrap().as_ptr());
     driver.DriverUnload = Some(driver_exit);
 
-    // 1) Crear y mapear ring (64 KiB)
-    match MemoryRing::create(r"Global\MySharedSection", 64 * 1024) {
-        Ok(mut ring) => {
-            if let Err(e) = ring.map() {
-                println!("Error mapeando ring: 0x{:X}", e);
+    // -------------------------------------------------------------------- ring
+    let ring = match MemoryRing::create(RING_NAME, RING_SIZE) {
+        Ok(mut r) => {
+            if let Err(e) = r.map() {
+                println!("Ring map failed: 0x{:X}", e);
                 return e;
             }
-            SHARED_RING = Some(ring);
+            // leak Box<MemoryRing> so we have a 'static reference everywhere
+            let raw = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(r));
+            RING_PTR.store(raw, Ordering::Release);
+            unsafe { &*raw }
         }
         Err(e) => {
-            println!("Error creando ring: 0x{:X}", e);
+            println!("Ring create failed: 0x{:X}", e);
             return e;
         }
-    }
-
-    // 2) Registrar callback de creación de procesos
-    let status = PsSetCreateProcessNotifyRoutineEx(Some(process_notify_ring), false);
-    if status != STATUS_SUCCESS {
-        println!("Falló registro de notify: 0x{:X}", status);
-        return status;
-    }
-
-    // 3) Debug: imprimimos la ruta del registry
-    let reg = {
-        let us = &*registry_path;
-        let sl = slice::from_raw_parts(us.Buffer, (us.Length / 2) as usize);
-        String::from_utf16_lossy(sl)
     };
-    println!("EDR Driver listo. Registry Path: {}", reg);
 
+    // -------------------------------------------------------------------- callback
+    if let Err(s) = psnotify::register(ring) {
+        println!("PsSetCreateProcessNotifyRoutineEx failed: 0x{:X}", s);
+        return s;
+    }
+
+    // -------------------------------------------------------------------- debug path
+    let reg = {
+        let s = &*registry_path;
+        let utf16 = slice::from_raw_parts(s.Buffer, (s.Length / 2) as usize);
+        alloc::string::String::from_utf16_lossy(utf16)
+    };
+    println!("EDR driver ready – registry path: {}", reg);
     STATUS_SUCCESS
 }
 
 extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
-    println!("EDR Driver Unloading...");
+    println!("EDR driver unloading…");
 
-    unsafe {
-        // Removemos callback
-        let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify_ring), true);
-        // Al asignar None, se invoca Drop en MemoryRing (unmap + close)
-        SHARED_RING = None;
+    // 1 – unregister process callback
+    unsafe { psnotify::unregister().ok(); }
+
+    // 2 – drop ring
+    let ptr = RING_PTR.swap(ptr::null_mut(), Ordering::AcqRel);
+    if !ptr.is_null() {
+        unsafe { alloc::boxed::Box::from_raw(ptr); }   // calls Drop, unmap + close
     }
 
-    println!("EDR Driver Unloaded.");
+    println!("EDR driver unloaded.");
 }

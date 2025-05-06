@@ -4,16 +4,22 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
+[features]
+default = ["std"]
+std     = ["prost/std", "prost/derive"]
+kernel  = ["prost/derive"]       # no_std + alloc
+
+
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.13.1"
 
 [dependencies]
-# Must match the prost version tonic expects (0.13.x)
-prost       = "0.13.5"
-prost-types = "0.13.5"
+prost        = { version = "0.13", default-features = false }
+prost-types  = { version = "0.13", default-features = false }
 
 # gRPC runtime support
-tonic = { version = "0.12", features = ["transport"] }
+tonic = { version = "0.13.1", features = ["transport"] }
 
 # Tokio for your gRPC tests
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+

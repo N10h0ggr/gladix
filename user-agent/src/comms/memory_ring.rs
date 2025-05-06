@@ -1,77 +1,132 @@
-// src/comms/memory_ring.rs
-use memmap2::{MmapMut, MmapOptions};
-use std::{
-    fs::OpenOptions,
-    path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
-};
-use tokio::task::yield_now;
+//! Memory‑mapped ring‑buffer reader
+//! --------------------------------
+//! The kernel driver exposes a named section (`Global\MySharedSection`)
+//! that contains a *single‑producer / single‑consumer* byte ring:
+//
+//!   ┌──── 0                             size (64 KiB) ────┐
+//!   │ u32 write_off │   len | msg   len | msg   …        │
+//!   └─────────────────────────────────────────────────────┘
+//
+//! * `write_off` **always** moves forward; the writer wraps to 4 whenever the
+//!   next message would cross the buffer end.
+//! * Each message is length‑prefixed (`u32`, little‑endian, unaligned).
+//! * Reader keeps its own cursor (`READ_OF`, in process memory).
+//!
+//! This file maps the section READ‑ONLY and provides `next()` which returns the
+//! next complete protobuf blob (if any).
 
-/// Un anillo de memoria mapeada por un driver y leído desde user-mode.
+use std::{
+    ffi::OsStr,
+    io,
+    os::windows::prelude::OsStrExt,
+    ptr,
+    slice,
+    sync::atomic::{AtomicU32, Ordering},
+};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::Memory::{
+        OpenFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ,
+        MEMORY_MAPPED_VIEW_ADDRESS,
+    },
+};
+
+/// Section name chosen by the kernel driver (`ZwCreateSection`).
+const SECTION_NAME: &str = r"Global\MySharedSection";
+/// Size used by the driver (power‑of‑two simplifies wrap logic).
+const RING_SIZE:     usize = 64 * 1024;
+
+/// Thin RAII wrapper: maps the driver’s section on construction,
+/// unmaps/close on drop.
 pub struct MemoryRing {
-    mmap:        MmapMut,
-    head:        *mut AtomicUsize,
-    tail:        *mut AtomicUsize,
-    data_offset: usize,
-    buf_size:    usize,
+    handle: HANDLE,                     // duplicated kernel section handle
+    view:   MEMORY_MAPPED_VIEW_ADDRESS, // returned by MapViewOfFile (needed for unmap)
+    base:   *mut u8,                    // raw pointer for fast offset arithmetic
+    size:   usize,                      // == RING_SIZE
 }
 
-// Permitir uso concurrente ya que accesos son atómicos y el mapping es seguro.
+// Safe because we never mutate shared memory concurrently from multiple threads.
 unsafe impl Send for MemoryRing {}
 unsafe impl Sync for MemoryRing {}
 
 impl MemoryRing {
-    /// Abre (y mapea) el fichero de anillo.
-    pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        let len = metadata.len() as usize;
-        let header_bytes = 2 * std::mem::size_of::<AtomicUsize>();
-        if len <= header_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "file too small for MemoryRing header",
-            ));
+    /// Try to open and map the named section (read‑only).
+    pub fn open() -> io::Result<Self> {
+        // Build null‑terminated UTF‑16 string for Win32 API
+        let wide: Vec<u16> = OsStr::new(SECTION_NAME)
+            .encode_wide()
+            .chain(Some(0))     // NUL
+            .collect();
+
+        // OpenFileMappingW returns a HANDLE we must close later
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
         }
 
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        // Asumimos alineación de página al inicio
-        let ptr = mmap.as_ptr() as *mut AtomicUsize;
-        let head = ptr;
-        let tail = unsafe { ptr.add(1) };
+        // MapViewOfFile → shared memory in our process
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, RING_SIZE) };
+        if view.Value.is_null() {
+            unsafe { CloseHandle(handle) };
+            return Err(io::Error::last_os_error());
+        }
 
-        Ok(MemoryRing { mmap, head, tail, data_offset: header_bytes, buf_size: len - header_bytes })
+        Ok(Self {
+            handle,
+            view,
+            base: view.Value as *mut u8,
+            size: RING_SIZE,
+        })
     }
 
-    /// Extrae el siguiente evento (payload puro) si hay datos; espera (async) si está vacío.
-    pub async fn pop(&self) -> Option<Vec<u8>> {
-        loop {
-            let h = unsafe { (*self.head).load(Ordering::Acquire) };
-            let t = unsafe { (*self.tail).load(Ordering::Acquire) };
-            if h == t {
-                yield_now().await;
-                continue;
-            }
+    /// Return the next complete message, *if* the writer has already published it.
+    /// Non‑blocking: returns `None` when there is no new data.
+    pub fn next(&self) -> Option<Vec<u8>> {
+        /* ── 1 ▸ observe producer cursor (Acquire) ────────────────────────── */
+        let write_of = unsafe {
+            (self.base as *const AtomicU32)
+                .as_ref()?
+                .load(Ordering::Acquire)
+        } as usize;
+        if write_of < 4 { return None }          // writer hasn’t initialised yet
 
-            let off = self.data_offset + h;
-            let len_bytes = &self.mmap[off..off + 4];
-            let payload_len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-            let start = off + 4;
-            let end = start + payload_len;
-            let data = self.mmap[start..end].to_vec();
+        /* ── 2 ▸ reader cursor lives in static mut ───────────────────────── */
+        static mut READ_OF: usize = 4;           // start right after write_off
+        let mut ro = unsafe { READ_OF };
+        if ro == write_of { return None }        // already up‑to‑date
 
-            let total = 4 + payload_len;
-            let pad = (8 - (total % 8)) % 8;
-            let mut new_h = h + total + pad;
-            if new_h >= self.buf_size {
-                new_h -= self.buf_size;
-            }
-            unsafe { (*self.head).store(new_h, Ordering::Release) };
+        /* ── 3 ▸ wrap if reaching end ────────────────────────────────────── */
+        if ro + 4 > self.size { ro = 4; }
 
-            return Some(data);
+        /* ── 4 ▸ read length prefix (unaligned) ───────────────────────────── */
+        let len = unsafe { ptr::read_unaligned(self.base.add(ro) as *const u32) } as usize;
+        if len == 0 || len > (self.size - 4) {
+            // Corrupted length → resynchronise
+            unsafe { READ_OF = 4 };
+            return None;
+        }
+
+        /* ── 5 ▸ ensure full message already written ─────────────────────── */
+        if ro + 4 + len > write_of { return None } // writer still working
+
+        /* ── 6 ▸ copy out & advance cursor ───────────────────────────────── */
+        let src = unsafe { slice::from_raw_parts(self.base.add(ro + 4), len) };
+        let mut buf = vec![0u8; len];
+        buf.copy_from_slice(src);
+
+        ro += 4 + len;
+        if ro >= self.size { ro = 4; }
+        unsafe { READ_OF = ro };
+
+        Some(buf)
+    }
+}
+
+impl Drop for MemoryRing {
+    fn drop(&mut self) {
+        unsafe {
+            UnmapViewOfFile(self.view); // unmap first
+            CloseHandle(self.handle);   // then close handle
         }
     }
 }

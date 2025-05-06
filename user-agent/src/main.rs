@@ -1,19 +1,15 @@
 // src/main.rs
-
-//! Agent entry‑point: Windows service or console fallback.
-//!
-//! **Refactored** to leverage the new [`Config::load()`] API that returns a fully‑validated
-//! runtime configuration.  All bespoke glue for reading TOML, converting risk groups, and
-//! validating paths has been removed.
-//!
-//! Execution flow
-//! ————————————————————————————————————————————————————————————————————————
-//! 1. `Config::load()` merges embedded defaults → optional file → env vars → CLI.
-//! 2. Structured logging initialised from `cfg.logging`.
-//! 3. SQLite opened; async writers & maintenance tasks spawned.
-//! 4. Windows SCM registration (or console fallback).
-//! 5. Directory scanner launched in blocking thread.
-//! 6. Graceful shutdown via service control or Ctrl‑C.
+//! Gladix user‑agent – Windows service or console app.
+//
+//  Execution flow
+//  ──────────────────────────────────────────────────────────────────
+//  1. Load configuration (embedded defaults ← TOML ← env).
+//  2. Initialise structured logging + Prometheus registry.
+//  3. Open / migrate SQLite; spawn async writers + maintenance jobs.
+//  4. Start ring‑buffer router (reads BaseEvent blobs from the driver).
+//  5. Register with Windows SCM (or fall back to console).
+//  6. Spawn directory scanner on its own blocking thread.
+//  7. Wait for Ctrl‑C or SCM “Stop” request → graceful shutdown.
 
 mod comms;
 mod config;
@@ -27,13 +23,11 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process,
-    sync::mpsc,
+    sync::{mpsc, Arc},
     thread,
     time::Duration,
 };
-use std::sync::Arc;
-use tokio::runtime::Runtime;
-use tokio::sync::{broadcast, mpsc as async_mpsc};
+use tokio::{runtime::Runtime, sync::{broadcast, mpsc as async_mpsc}};
 use windows_service::{
     define_windows_service,
     service::{
@@ -44,23 +38,31 @@ use windows_service::{
     service_dispatcher::start,
 };
 
-use crate::comms::WrappedEvent;
-use crate::config::{load, Config};
-use shared::events::{ProcessEvent};
+use shared::events::{
+    ProcessEvent, FileEvent, NetworkEvent, EtwEvent
+};
+use crate::{
+    comms::{
+        memory_ring::MemoryRing,
+        router::KernelRingRouter,
+        Buses,
+        WrappedEvent,
+    },
+    config::{load, Config},
+};
 use db::{
-    connection::{init_database, open_db_connection},
+    connection::{init_database, open_db_connection, db_path},
     maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance},
     spawn_writer,
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use scanner::run_scanner;
-use crate::comms::listeners::{Buses, Listener, RingListener};
-use crate::comms::memory_ring::MemoryRing;
 
 const SERVICE_NAME: &str = "Gladix";
 
 define_windows_service!(ffi_service_main, service_main);
 
+/// One‑liner helper for fatal errors (bypasses the logger so it works early).
 macro_rules! fatal {
     ($ctx:expr, $($arg:tt)+) => {{
         eprintln!(
@@ -73,7 +75,7 @@ macro_rules! fatal {
     }};
 }
 
-/// Returns the directory that contains the running executable.
+/// Top‑level helper: directory where the running executable lives.
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .expect("Cannot determine exe path")
@@ -82,20 +84,19 @@ fn exe_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Initialise structured logging according to `cfg.logging`.
+/// Structured logging initialisation (stdout + optional file).
 fn setup_logging(cfg: &Config, exe_dir: &Path) -> Result<(), fern::InitError> {
     let level = match cfg.logging.level.to_uppercase().as_str() {
         "ERROR" => LevelFilter::Error,
         "WARN"  => LevelFilter::Warn,
         "DEBUG" => LevelFilter::Debug,
         "TRACE" => LevelFilter::Trace,
-        _        => LevelFilter::Info,
+        _       => LevelFilter::Info,
     };
 
-    let log_path = cfg
-        .logging
-        .enable
-        .then(|| exe_dir.join(cfg.logging.file.as_deref().unwrap_or("agent.log")));
+    let log_path = cfg.logging.enable.then(|| {
+        exe_dir.join(cfg.logging.file.as_deref().unwrap_or("agent.log"))
+    });
 
     let mut dispatch = Dispatch::new()
         .format(|out, msg, record| {
@@ -120,77 +121,81 @@ fn setup_logging(cfg: &Config, exe_dir: &Path) -> Result<(), fern::InitError> {
     Ok(())
 }
 
-fn run_service() {
-    // ────────────────────────────────────────────────────────────────────
-    // 1 ▸ Context & configuration
-    // ────────────────────────────────────────────────────────────────────
-    let exe_dir = exe_dir();
+/*──────────────────────────── helper functions ────────────────────────────*/
 
-    // Loader merges defaults → exe_dir/config.toml → env (APP__) → CLI (None here)
+/// Create `Buses<E>` **and** spawn an async DB writer
+/// (only usable for event types whose `WrappedEvent<E>` implements `BatchInsert`).
+fn make_buses_with_writer<E>(
+    rt: &Runtime,
+    exe_dir: &Path,
+    db_cfg: &config::model::DatabaseConfig,
+    tag: &'static str,
+) -> Buses<E>
+where
+    E: Clone + Send + 'static,
+    WrappedEvent<E>: db::batch_inserts::BatchInsert<WrappedEvent<E>>,
+{
+    let conn = open_db_connection(exe_dir, db_cfg)
+        .unwrap_or_else(|e| fatal!(tag, "db open: {e}"));
+
+    let (db_tx, db_rx) = async_mpsc::channel::<WrappedEvent<E>>(10_000);
+    spawn_writer(rt, conn, db_rx, db_cfg);
+
+    let (intel_tx, _) = broadcast::channel::<WrappedEvent<E>>(1_024);
+    Buses { db_tx, intel_tx }
+}
+
+/*──────────────────────────── main service routine ────────────────────────*/
+
+fn run_service() {
+    /* 1 ▸ Load configuration  */
+    let exe_dir = exe_dir();
     let cfg = load(&exe_dir.join("config.toml"))
         .unwrap_or_else(|e| fatal!("config", "{}", e));
 
-    // ────────────────────────────────────────────────────────────────────
-    // 2 ▸ Logging
-    // ────────────────────────────────────────────────────────────────────
+    /* 2 ▸ Logging  */
     setup_logging(&cfg, &exe_dir).expect("Logging setup failed");
     log::info!("Service bootstrap initiated");
 
-    // ────────────────────────────────────────────────────────────────────
-    // 3 ▸ Prometheus metrics
-    // ────────────────────────────────────────────────────────────────────
-    let _recorder = PrometheusBuilder::new().install();
+    /* 3 ▸ Prometheus registry */
+    let _prom = PrometheusBuilder::new().install();
 
-    // ────────────────────────────────────────────────────────────────────
-    // 4 ▸ Database initialisation
-    // ────────────────────────────────────────────────────────────────────
-    let db_cfg  = &cfg.database;
-    let db_path = db::connection::db_path(&exe_dir, db_cfg);
+    /* 4 ▸ Database schema migration (only once) */
+    let db_cfg = &cfg.database;
+    let db_path_on_disk = db_path(&exe_dir, db_cfg);
+    init_database(&exe_dir, db_cfg)
+        .unwrap_or_else(|e| fatal!("database", "{e}"));
 
-    let db_conn_process = init_database(&exe_dir, db_cfg).unwrap_or_else(|e| fatal!("database", "{e}"));
-
-    // ────────────────────────────────────────────────────────────────────
-    // 5 ▸ Tokio runtime & async DB writers
-    // ────────────────────────────────────────────────────────────────────
+    /* 5 ▸ Tokio runtime + async DB writers */
     let rt = Runtime::new().expect("Tokio runtime failed");
-    let (process_db_tx, process_db_rx) =
-        async_mpsc::channel::<WrappedEvent<ProcessEvent>>(10_000);
-    spawn_writer(&rt, db_conn_process, process_db_rx, db_cfg);
 
-    // 5a ▸ MemoryRing listener para ProcessEvent
-    let process_ring = MemoryRing::open(r"\\Gladix\process_ring")
-        .unwrap_or_else(|e| fatal!("ring", "process_ring: {}", e));
-    let process_listener = Arc::new(RingListener::<ProcessEvent>::new(
-        "process",
-        process_ring,
-        "7119d098-3100-4fc2-ba48-52b1fabdb4b8",
-    ));
+    let process_buses = make_buses_with_writer::<ProcessEvent>(&rt, &exe_dir, db_cfg, "process");
+    let file_buses    = make_buses_with_writer::<FileEvent   >(&rt, &exe_dir, db_cfg, "file");
+    let net_buses     = make_buses_with_writer::<NetworkEvent>(&rt, &exe_dir, db_cfg, "net");
+    let etw_buses     = make_buses_with_writer::<EtwEvent    >(&rt, &exe_dir, db_cfg, "etw");
 
-    // Creamos también el canal de broadcast para intel
-    let (process_intel_tx, _) =
-        broadcast::channel::<WrappedEvent<ProcessEvent>>(1_024);
 
-    // Ahora sí conectamos los _mismos_ senders al Buses…
-    let process_buses = Buses {
-        db_tx:    process_db_tx.clone(),
-        intel_tx: process_intel_tx.clone(),
-    };
+    /* 5a ▸ Ring‑buffer router */
+    let ring = MemoryRing::open()
+        .unwrap_or_else(|e| fatal!("ring", "cannot open shared ring: {e}"));
+    Arc::new(KernelRingRouter::new(
+        ring,
+        Some(process_buses.clone()), // current usage
+        None,                        // ImageLoadEvent – coming soon
+        None,                        // ObjectOpEvent  – coming soon
+    )).spawn();
 
-    process_listener.spawn(process_buses);
+    /* 5b ▸ SQLite maintenance tasks */
+    spawn_ttl_cleanup(&rt, db_path_on_disk.clone(), db_cfg);
+    spawn_wal_maintenance(&rt, db_path_on_disk, db_cfg);
 
-    // Background DB‑maintenance tasks
-    spawn_ttl_cleanup(&rt, db_path.clone(), db_cfg);
-    spawn_wal_maintenance(&rt, db_path.clone(), db_cfg);
-
-    // ────────────────────────────────────────────────────────────────────
-    // 6 ▸ Windows SCM integration
-    // ────────────────────────────────────────────────────────────────────
+    /* 6 ▸ Windows SCM / console fallback */
     let (svc_tx, svc_rx) = mpsc::sync_channel(1);
     let status_handle = service_control_handler::register(
         SERVICE_NAME,
         move |ctrl| match ctrl {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                log::warn!("Stop requested via SCM");
+                log::warn!("SCM stop/shutdown requested");
                 let _ = svc_tx.send(());
                 ServiceControlHandlerResult::NoError
             }
@@ -210,37 +215,32 @@ fn run_service() {
     };
     status_handle.set_service_status(status.clone()).unwrap();
 
-    // ────────────────────────────────────────────────────────────────────
-    // 7 ▸ Scanner thread
-    // ────────────────────────────────────────────────────────────────────
+    /* 7 ▸ Directory scanner (blocking thread) */
     status.current_state = ServiceState::Running;
     status_handle.set_service_status(status.clone()).unwrap();
 
-    let groups = cfg.scanner.clone(); // already runtime‑ready `RiskGroup`s
-    log::info!("Service running with {} scanner groups", groups.len());
-
+    let groups = cfg.scanner.clone();          // already validated
     let cache_path = exe_dir.join("persistent_cache.json");
     thread::spawn(move || run_scanner(groups, cache_path));
+    log::info!("Service running");
 
-    // ────────────────────────────────────────────────────────────────────
-    // 8 ▸ Shutdown
-    // ────────────────────────────────────────────────────────────────────
-    let _ = svc_rx.recv();
+    /* 8 ▸ Shutdown handshake */
+    let _ = svc_rx.recv();                     // block until stop requested
     log::warn!("Shutdown initiated");
     status.current_state = ServiceState::Stopped;
     status_handle.set_service_status(status).unwrap();
     log::info!("Service stopped cleanly");
 }
 
-fn service_main(_args: Vec<OsString>) {
-    run_service();
-}
+/*──────────────────────── Windows‑service glue ───────────────────────────*/
+
+fn service_main(_args: Vec<OsString>) { run_service() }
 
 fn main() {
     // When not launched by the SCM we fall back to console mode.
     if start(SERVICE_NAME, ffi_service_main).is_err() {
         eprintln!(
-            "[{}][ERROR][main] Not a service; falling back to console.",
+            "[{}][WARN ][main] Not running as service; starting in console mode.",
             Local::now().to_rfc3339()
         );
         run_service();
