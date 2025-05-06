@@ -48,7 +48,7 @@ use crate::comms::WrappedEvent;
 use crate::config::{load, Config};
 use shared::events::{ProcessEvent};
 use db::{
-    connection::{init_database, open_db_connection},
+    connection::{init_database},
     maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance},
     spawn_writer,
 };

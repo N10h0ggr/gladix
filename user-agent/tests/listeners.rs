@@ -5,7 +5,7 @@ use std::{
     fs::{File, OpenOptions},
     mem::size_of,
     sync::{Arc, atomic::{AtomicUsize, Ordering}},
-    time::{Duration, SystemTime},
+    time::{Duration},
 };
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -13,7 +13,7 @@ use memmap2::MmapOptions;
 use prost::Message;
 use tokio::{runtime::Runtime, sync::{mpsc, broadcast}};
 use rusqlite::Connection;
-use chrono::Utc;
+
 
 use agent::config::{load, model::Config as AppConfig};
 use agent::db::{connection::{init_database, db_path}, spawn_writer};
@@ -22,7 +22,7 @@ use agent::comms::{
     memory_ring::MemoryRing,
     listeners::{Buses, RingListener, Listener},
 };
-use shared::events::{BaseEvent, base_event, ProcessEvent, NetworkEvent, network_event::Direction};
+use shared::events::{ProcessEvent, NetworkEvent, network_event::Direction};
 /// Simula que un driver escribe **solo** el payload serializado en el ring.
 fn push_raw_event(file: &File, buf: &[u8]) {
     let header_bytes = 2 * size_of::<AtomicUsize>();

@@ -2,7 +2,6 @@ use std::{path::PathBuf, thread::sleep, time::Duration};
 use std::time::SystemTime;
 use tokio::{runtime::Runtime, sync::mpsc};
 use rusqlite::Connection;
-use chrono::Utc;
 use tempfile::NamedTempFile;
 use shared::events::{FileEvent, file_event::Operation as FileOperation, NetworkEvent, network_event::Direction, EtwEvent};
 
