@@ -11,7 +11,6 @@
 //! This module only needs **write** capability, so the mapping is
 //! `PAGE_READWRITE`.
 
-#![no_std]       // already at crate root, but harmless here
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -21,30 +20,32 @@ use core::{
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use wdk_sys::{
-    HANDLE, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING, OBJECT_ATTRIBUTES,
-    PAGE_READWRITE, SECTION_ALL_ACCESS, SEC_COMMIT,
-    ntddk::{
-        RtlInitUnicodeString, ZwClose, ZwCreateSection, ZwDuplicateObject,
-        ZwMapViewOfSection, ZwUnmapViewOfSection,
-    },
-};
-
+use wdk::println;
+use wdk_sys::{HANDLE, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING, OBJECT_ATTRIBUTES, PAGE_READWRITE, SECTION_ALL_ACCESS, SEC_COMMIT, ntddk::{
+    RtlInitUnicodeString, ZwClose, ZwCreateSection, ZwDuplicateObject,
+    ZwMapViewOfSection, ZwUnmapViewOfSection, MmMapViewInSystemSpace, MmUnmapViewInSystemSpace
+}, SIZE_T, SECTION_MAP_READ, SECTION_MAP_WRITE, KPROCESSOR_MODE};
+use wdk_sys::_MODE::KernelMode;
+use wdk_sys::ntddk::ObReferenceObjectByHandle;
 use crate::consts::{
     SECTION_INHERIT_VIEW_SHARE, nt_current_process, initialize_object_attributes,
 };
 
+unsafe extern "system" {
+    // matches Windows’ ObfDereferenceObject signature
+    fn ObDereferenceObject(ReferencedObject: *mut core::ffi::c_void);
+}
+
 /// Name and size must match the user‑mode reader.
-pub const RING_NAME: &str  = r"Global\MySharedSection";
-pub const RING_SIZE: usize = 64 * 1024;
 
 /*──────────────────── struct ───────────────────*/
 
 pub struct MemoryRing {
     section_handle: HANDLE,
-    size:          usize,
-    base:          *mut u8,             // mapping base in kernel
-    write_offset:  AtomicUsize,         // monotonically increasing cursor
+    section_obj:    *mut core::ffi::c_void,   // <‑‑ new
+    base:           *mut u8,
+    size:           usize,
+    write_offset:   AtomicUsize,
 }
 
 /*──────────────────── impl ─────────────────────*/
@@ -83,60 +84,56 @@ impl MemoryRing {
                 ptr::null_mut(),
             )
         };
+        println!("MemoryRing::create: ZwCreateSection({:?}) → {:#x}", name, st);
         if st != STATUS_SUCCESS {
             return Err(st);
         }
 
         Ok(Self {
             section_handle: handle,
+            section_obj: ptr::null_mut(),
             size,
             base: ptr::null_mut(),
-            write_offset: AtomicUsize::new(0),
+            write_offset: AtomicUsize::new(4),
         })
     }
 
     /*—— map into kernel address space —————————*/
     pub fn map(&mut self) -> Result<(), NTSTATUS> {
-        let mut base: *mut c_void = ptr::null_mut();
-        let mut view_size: u64 = self.size as u64;
-        let st = unsafe {
-            ZwMapViewOfSection(
+        // 1) turn the HANDLE into a real object pointer
+        let mut obj: *mut core::ffi::c_void = core::ptr::null_mut();
+        let status = unsafe {
+            ObReferenceObjectByHandle(
                 self.section_handle,
-                nt_current_process(),
-                &mut base,
-                0,
-                0,
-                ptr::null_mut(),
-                &mut view_size,
-                SECTION_INHERIT_VIEW_SHARE as i32,
-                0,
-                PAGE_READWRITE,
+                SECTION_MAP_READ | SECTION_MAP_WRITE,   // desired access
+                core::ptr::null_mut(),                  // object type = Section
+                KernelMode as KPROCESSOR_MODE,
+                &mut obj,
+                core::ptr::null_mut(),
             )
         };
-        if st != STATUS_SUCCESS {
-            return Err(st);
+        if status != STATUS_SUCCESS {
+            return Err(status);
         }
+
+        // 2) map it in system space
+        let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut view_size = self.size as SIZE_T;
+        let status = unsafe {
+            MmMapViewInSystemSpace(obj, &mut base, &mut view_size)
+        };
+        if status != STATUS_SUCCESS {
+            // drop the ref before returning
+            unsafe { ObDereferenceObject(obj) };
+            return Err(status);
+        }
+
+        self.section_obj = obj;
         self.base = base as *mut u8;
+        unsafe { core::ptr::write_volatile(self.base as *mut u32, 4) };
         Ok(())
     }
 
-    /*—— duplicate handle for user‑mode (optional) —*/
-    #[allow(dead_code)]
-    pub fn dup_for_user(&self, target_process: HANDLE, opts: u32) -> Result<HANDLE, NTSTATUS> {
-        let mut dup: HANDLE = ptr::null_mut();
-        let st = unsafe {
-            ZwDuplicateObject(
-                nt_current_process(),
-                self.section_handle,
-                target_process,
-                &mut dup,
-                SECTION_ALL_ACCESS,
-                0,
-                opts,
-            )
-        };
-        if st == STATUS_SUCCESS { Ok(dup) } else { Err(st) }
-    }
 
     /*—— write bytes, wrapping on overflow ————*/
     /// Write bytes, wrapping at buffer end.
@@ -167,7 +164,6 @@ impl MemoryRing {
         // 2) update our local cursor
         self.write_offset.store(new_off, Ordering::Release);
     }
-
 }
 
 /*──────────────────── Drop ─────────────────────*/
@@ -175,8 +171,10 @@ impl MemoryRing {
 impl Drop for MemoryRing {
     fn drop(&mut self) {
         if !self.base.is_null() {
-            // ignore status – nothing we can do on failure
-            unsafe { let _ = ZwUnmapViewOfSection(nt_current_process(), self.base as *mut c_void); }
+            unsafe { MmUnmapViewInSystemSpace(self.base as _) };
+        }
+        if !self.section_obj.is_null() {
+            unsafe { ObDereferenceObject(self.section_obj) };
         }
         unsafe { let _ = ZwClose(self.section_handle); }
     }

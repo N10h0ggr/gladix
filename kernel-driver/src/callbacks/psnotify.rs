@@ -41,7 +41,7 @@ pub fn register(ring: &'static MemoryRing) -> Result<(), NTSTATUS> {
     unsafe {
         RING = ring as *const _;
         // SAFETY: parameters match WDK prototype, `Remove = 0` (FALSE).
-        let st = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 0u8);
+        let st = unsafe { PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 0u8) };
         if st == STATUS_SUCCESS { Ok(()) } else { Err(st) }
     }
 }
@@ -52,7 +52,7 @@ pub fn register(ring: &'static MemoryRing) -> Result<(), NTSTATUS> {
 /// Call once during driver unload.
 pub unsafe fn unregister() -> Result<(), NTSTATUS> {
     // SAFETY: same call, `Remove = 1` (TRUE).
-    let st = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1u8);
+    let st = unsafe { PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1u8) };
     if st == STATUS_SUCCESS { Ok(()) } else { Err(st) }
 }
 

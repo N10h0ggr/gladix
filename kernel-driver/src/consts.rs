@@ -1,7 +1,7 @@
 //! Assorted WDK constants & helpers missing in `wdk‑sys`.
 
 use core::ptr;
-use wdk_sys::{HANDLE, OBJECT_ATTRIBUTES, STATUS_INVALID_PARAMETER, UNICODE_STRING};
+use wdk_sys::{HANDLE, OBJECT_ATTRIBUTES, UNICODE_STRING};
 
 /*────────── missing constants ─────────*/
 

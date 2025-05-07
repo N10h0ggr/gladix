@@ -1,142 +1,155 @@
-//! … previous docs …
-
+//! kernel-driver/src/lib.rs
 #![no_std]
 
 extern crate alloc;
-#[cfg(not(test))]
-extern crate wdk_panic;
+#[cfg(not(test))] extern crate wdk_panic;
 
-use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
+use alloc::{boxed::Box, string::String};
 use core::{
     ptr,
-    ptr::NonNull,
     slice,
     sync::atomic::{AtomicPtr, Ordering},
 };
 use wdk::println;
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
-    DRIVER_OBJECT, PCUNICODE_STRING, PDEVICE_OBJECT,
-    NTSTATUS, STATUS_SUCCESS,
-    ntddk::{DbgPrint, IoCreateDevice, IoCreateSymbolicLink},
+    DRIVER_OBJECT, PCUNICODE_STRING, PDEVICE_OBJECT, NTSTATUS, STATUS_SUCCESS,
+    FILE_DEVICE_UNKNOWN, IRP_MJ_READ, IRP_MJ_WRITE, IRP_MJ_CREATE,
+    IRP_MJ_CLOSE, IRP_MJ_DEVICE_CONTROL,
 };
+use wdk_sys::ntddk::{IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink};
 
+use shared::constants::{RING_SIZE, RING_NAME};
+#[global_allocator]
+static ALLOCATOR: WdkAllocator = WdkAllocator;
+
+/*---------------- modules ----------------*/
 mod communications;
-mod callbacks;
-mod device;
+mod callbacks;   // psnotify
+mod dispatch;
+mod helpers;
 mod consts;
 
-use communications::memory_ring::{MemoryRing, RING_NAME, RING_SIZE};
+use communications::memory_ring::{MemoryRing};
 use callbacks::psnotify;
-use device::{GLADIX_TYPE, init_dispatch, delete_device};
+use dispatch::*;
+use helpers::*;
 
-/*------------ globals & allocator (unchanged) -------------*/
+/*---------------- globals ----------------*/
+static mut DISPATCHER: Dispatcher = Dispatcher::new();
 
-static RING_PTR: AtomicPtr<MemoryRing> = AtomicPtr::new(ptr::null_mut());
-
-#[cfg(not(test))]
-#[global_allocator]
-static GLOBAL: WdkAllocator = WdkAllocator;
-
-/*------------ UTF‑16 helper (unchanged) -------------------*/
-
-fn make_unicode(s: &str) -> wdk_sys::UNICODE_STRING {
-    let utf16: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
-    let mut us = wdk_sys::UNICODE_STRING::default();
-    unsafe { wdk_sys::ntddk::RtlInitUnicodeString(&mut us, utf16.as_ptr()) };
-    us
+//
+// Device Extension Structure
+//
+// This structure is allocated per-device and holds our timer, DPC,
+// spin lock, and a counter that is updated by the DPC.
+#[repr(C)]
+pub struct DeviceExtension {
+    ring_ptr: *mut MemoryRing,
 }
 
-/*------------ DriverEntry -------------------------------*/
+/*---------------- DriverEntry ----------------*/
 
-#[allow(non_snake_case)]
-#[unsafe(export_name = "DriverEntry")]         // <‑‑ replace problematic #[no_mangle]
-pub extern "system" fn driver_entry(
+
+#[unsafe(no_mangle)]         // exports "DriverEntry"
+pub unsafe extern "C" fn DriverEntry(
     driver: *mut DRIVER_OBJECT,
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
-    /* banner */
-    unsafe {
-        DbgPrint(CString::new("Gladix driver loading…\n").unwrap().as_ptr());
-    }
+    println!("DriverEntry: Gladix loading...");
 
-    /* 1 ▸ ring */
-    let ring_ref: &'static MemoryRing = match MemoryRing::create(RING_NAME, RING_SIZE)
-        .and_then(|mut r| { r.map()?; Ok(r) }) {
-        Ok(r) => {
-            let raw = Box::into_raw(Box::new(r));
-            RING_PTR.store(raw, Ordering::Release);
-            unsafe { &*raw }
-        }
+    /* 1 ─ ring section ------------------------------------------------------*/
+    // TODO: Handle when Shared Section already exists.
+    let raw_ring  = match MemoryRing::create(RING_NAME, RING_SIZE)
+        .and_then(|mut r| { r.map()?; Ok(r) })
+    {
+        Ok(r) => Box::into_raw(Box::new(r)),
         Err(st) => return st,
     };
+    let ring_ref = unsafe { &*raw_ring };
 
-    /* 2 ▸ process callback */
-    if let Err(st) = psnotify::register(ring_ref) {
-        unsafe { drop(Box::from_raw(RING_PTR.load(Ordering::Acquire))); }
+    /* 2 ─ process‑notify callback ------------------------------------------*/
+    // TODO: Check if process_notify function is beeing called
+    if let Err(st) = unsafe { psnotify::register(ring_ref) } {
+        unsafe { drop(Box::from_raw(raw_ring)); }
         return st;
     }
+    println!("DriverEntry: ring and callbacks OK");
 
-    /* 3 ▸ device object + symlink */
-    let drv = unsafe { &mut *driver };
-    let dev_name = make_unicode(r"\\Device\\GladixDrv");
+    /* 3 ─ device object -----------------------------------------------------*/
+    let dev_name = make_unicode(r"\Device\GladixDrv");
     let mut dev_obj: PDEVICE_OBJECT = ptr::null_mut();
     let st = unsafe {
         IoCreateDevice(
-            drv,
-            0,
+            driver,
+            size_of::<DeviceExtension>() as u32,
             &dev_name as *const _ as _,
-            GLADIX_TYPE,
+            FILE_DEVICE_UNKNOWN,
             0,
-            0,
+            0u8,                       // exclusive = FALSE
             &mut dev_obj,
         )
     };
     if st != STATUS_SUCCESS {
-        unsafe { psnotify::unregister().ok(); }
-        unsafe { drop(Box::from_raw(RING_PTR.load(Ordering::Acquire))); }
+        unsafe {
+            psnotify::unregister().ok();
+            drop(Box::from_raw(raw_ring));
+        }
         return st;
     }
+    println!("DriverEntry: device created");
 
-    // dispatch table
-    unsafe { init_dispatch(driver) };
-
-    let sym_name = make_unicode(r"\\DosDevices\\Gladix");
-    unsafe { IoCreateSymbolicLink(&sym_name as *const _ as _, &dev_name as *const _ as _); }
-
-    /* 4 ▸ registry path (debug) */
-    let reg_path = unsafe {
-        let us = &*registry_path;
-        let utf16 = slice::from_raw_parts(us.Buffer, (us.Length / 2) as usize);
-        String::from_utf16_lossy(utf16)
+    let dev_ext = unsafe {
+        &mut *((*dev_obj).DeviceExtension.cast::<DeviceExtension>())
     };
-    println!("Driver loaded. Registry path: {}", reg_path);
+    dev_ext.ring_ptr = raw_ring;
 
-    // store unload routine
-    unsafe { (*driver).DriverUnload = Some(driver_exit) };
+    /* 4 ─ dispatch table ----------------------------------------------------*/
+    unsafe {
+        let disp: *mut Dispatcher = core::ptr::addr_of_mut!(DISPATCHER); // raw ptr – avoids &mut
+        (*disp).register(IRP_MJ_READ,            dispatch_read);
+        (*disp).register(IRP_MJ_WRITE,           dispatch_write);
+        (*disp).register(IRP_MJ_CREATE,          dispatch_create);
+        (*disp).register(IRP_MJ_CLOSE,           dispatch_close);
+        (*disp).register(IRP_MJ_DEVICE_CONTROL,  dispatch_device_control);
+        (*disp).install(driver);
+    }
 
+    /* 5 ─ symbolic link -----------------------------------------------------*/
+    let sym = make_unicode(r"\DosDevices\Gladix");
+    unsafe { IoCreateSymbolicLink(&sym as *const _ as _, &dev_name as *const _ as _) };
+    println!("DriverEntry: IOCTL interface ready");
+
+    /* 6 ─ debug registry path ----------------------------------------------*/
+    let reg = unsafe {
+        let us = &*registry_path;
+        let w  = slice::from_raw_parts(us.Buffer, (us.Length / 2) as usize);
+        String::from_utf16_lossy(w)
+    };
+    println!("DriverEntry complete. Registry = {}", reg);
+
+    unsafe { (*driver).DriverUnload = Some(driver_unload) };
     STATUS_SUCCESS
 }
 
-/*------------ unload ------------------------------------*/
-
-extern "C" fn driver_exit(driver: *mut DRIVER_OBJECT) {
-    println!("Driver unloading…");
-
+/*──────── unload ────────*/
+extern "C" fn driver_unload(driver: *mut DRIVER_OBJECT) {
+    println!("Gladix: unloading...");
     unsafe {
-        // 1 ▸ unregister process callback
         psnotify::unregister().ok();
 
-        // 2 ▸ delete symbolic link + device
-        let sym = make_unicode(r"\\DosDevices\\Gladix");
-        wdk_sys::ntddk::IoDeleteSymbolicLink(&sym as *const _ as _);
-        delete_device((*driver).DeviceObject);
+        let sym = make_unicode(r"\DosDevices\Gladix");
+        IoDeleteSymbolicLink(&sym as *const _ as _);
+        IoDeleteDevice((*driver).DeviceObject);
 
-        // 3 ▸ drop ring
-        if let Some(raw) = NonNull::new(RING_PTR.swap(ptr::null_mut(), Ordering::AcqRel)) {
-            drop(Box::from_raw(raw.as_ptr()));
+        let dev_obj = (*driver).DeviceObject;
+        if !dev_obj.is_null() {
+            let dev_ext = &mut *((*dev_obj).DeviceExtension.cast::<DeviceExtension>());
+            let raw_ring = dev_ext.ring_ptr;
+            if !raw_ring.is_null() {
+                drop(Box::from_raw(raw_ring));
+            }
         }
     }
-
-    println!("Driver unloaded.");
+    println!("Gladix: unloaded.");
 }
