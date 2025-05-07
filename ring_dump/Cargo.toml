@@ -1,0 +1,10 @@
+[package]
+name = "ring_dump"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../shared", default-features = true }   # proto types
+windows-sys = { version = "0.59.0", features = ["Win32_System_Memory"] }
+prost = "0.13"   # only for `Message` trait
+prost-types = "0.13"

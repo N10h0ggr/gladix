@@ -17,9 +17,4 @@ tonic-build = "0.13.1"
 prost        = { version = "0.13", default-features = false }
 prost-types  = { version = "0.13", default-features = false }
 
-# gRPC runtime support
-tonic = { version = "0.13.1", features = ["transport"] }
-
-# Tokio for your gRPC tests
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

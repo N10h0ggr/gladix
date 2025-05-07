@@ -1,5 +1,11 @@
-//! Process‑creation notify → BaseEvent encoder
-#![no_std]
+//! Process‑creation notify  →  `BaseEvent::ProcessEvent`
+//!
+//! This kernel‑mode module registers a `PsSetCreateProcessNotifyRoutineEx`
+//! callback, turns every *process‑create* into a `shared::events::ProcessEvent`,
+//! wraps it in `BaseEvent`, serialises with `prost`, and pushes the raw bytes
+//! into the driver’s `MemoryRing`.
+//!
+//! We ignore *process‑exit* notifications (`info_ptr == NULL`).
 
 extern crate alloc;
 
@@ -10,100 +16,103 @@ use prost::Message;
 use prost_types::Timestamp;
 use shared::events::{base_event, BaseEvent, ProcessEvent};
 use wdk_sys::{
-    LARGE_INTEGER, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
-    ntddk::{
-        KE_QUERY_SYSTEM_TIME_PRECISE_NAME, PS_CREATE_NOTIFY_INFO, PEPROCESS,
-        KeQuerySystemTimePrecise, PsGetProcessId, PsSetCreateProcessNotifyRoutineEx,
-        PsRemoveCreateProcessNotifyRoutineEx,
-    },
+    HANDLE, LARGE_INTEGER, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
+    PS_CREATE_NOTIFY_INFO, PEPROCESS,
+    ntddk::{KeQuerySystemTimePrecise, PsGetProcessId, PsSetCreateProcessNotifyRoutineEx},
 };
 
 use crate::communications::memory_ring::MemoryRing;
 
-/*---------------------------------------------------------------------------*/
-/*  Public constants                                                          */
-/*---------------------------------------------------------------------------*/
+/*────────────────── constants ─────────────────*/
 
-/// Hard‑coded sensor GUID; swap for registry/IoCtl configuration if needed.
+/// Hard‑coded sensor GUID; load from registry/IoCtl in production.
 const SENSOR_GUID: &str = "00000000‑0000‑0000‑0000‑000000000000";
 
-/*---------------------------------------------------------------------------*/
-/*  Private globals                                                           */
-/*---------------------------------------------------------------------------*/
-
-/// Raw pointer to the MemoryRing supplied by the driver
+/// Pointer to the ring (written once in [`register`], read thereafter).
 static mut RING: *const MemoryRing = ptr::null();
 
-/*---------------------------------------------------------------------------*/
-/*  Registration helpers                                                      */
-/*---------------------------------------------------------------------------*/
+/*────────────────── registration ─────────────────*/
 
+/// Install the callback.
+///
+/// # Safety
+/// Call exactly once during driver initialisation.
 pub fn register(ring: &'static MemoryRing) -> Result<(), NTSTATUS> {
     unsafe {
         RING = ring as *const _;
-        let st = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), /*Remove=*/false);
+        // SAFETY: parameters match WDK prototype, `Remove = 0` (FALSE).
+        let st = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 0u8);
         if st == STATUS_SUCCESS { Ok(()) } else { Err(st) }
     }
 }
 
+/// Remove the callback (mirror of [`register`]).
+///
+/// # Safety
+/// Call once during driver unload.
 pub unsafe fn unregister() -> Result<(), NTSTATUS> {
-    let st = PsRemoveCreateProcessNotifyRoutineEx(Some(process_notify));
+    // SAFETY: same call, `Remove = 1` (TRUE).
+    let st = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1u8);
     if st == STATUS_SUCCESS { Ok(()) } else { Err(st) }
 }
 
-/*---------------------------------------------------------------------------*/
-/*  Utility functions                                                         */
-/*---------------------------------------------------------------------------*/
+/*────────────────── helpers ─────────────────*/
 
-/// Convert `UNICODE_STRING*` → `String`
+/// Convert a `UNICODE_STRING*` to a Rust `String`.
+///
+/// # Safety
+/// `uni` must be a valid, initialised pointer from the kernel.
 unsafe fn uni_to_string(uni: *const UNICODE_STRING) -> String {
     if uni.is_null() {
         return String::new();
     }
-    let u = &*uni;
+    // SAFETY: caller guarantees pointer validity.
+    let u = unsafe { &*uni };
     let len = (u.Length / 2) as usize;
-    let buf = slice::from_raw_parts(u.Buffer, len);
+    // SAFETY: buffer points to `len` UTF‑16 code units.
+    let buf = unsafe { slice::from_raw_parts(u.Buffer, len) };
     String::from_utf16_lossy(buf)
 }
 
-/// Convert Windows `LARGE_INTEGER` (100 ns since 1601‑01‑01) to Unix `Timestamp`
+/// Convert 100‑ns Windows ticks to protobuf `Timestamp`.
 fn li_to_timestamp(li: LARGE_INTEGER) -> Timestamp {
-    // 100 ns → seconds / nanos
-    let ticks = li.QuadPart as i64;
-    const WINDOWS_TO_UNIX_SECS: i64 = 11_644_473_600; // seconds between 1601‑01‑01 & 1970‑01‑01
-    let secs  = (ticks / 10_000_000) - WINDOWS_TO_UNIX_SECS;
+    // SAFETY: union field access.
+    let ticks = unsafe { li.QuadPart as i64 };
+    const WIN_TO_UNIX_SECS: i64 = 11_644_473_600;
+    let secs  = (ticks / 10_000_000) - WIN_TO_UNIX_SECS;
     let nanos = ((ticks % 10_000_000) * 100) as i32;
     Timestamp { seconds: secs, nanos }
 }
 
-/*---------------------------------------------------------------------------*/
-/*  Actual callback                                                           */
-/*---------------------------------------------------------------------------*/
+/*────────────────── callback ─────────────────*/
 
+/// Actual notify routine.
+/// Only creation events are processed (`info_ptr != NULL`).
 unsafe extern "C" fn process_notify(
-    parent: PEPROCESS,
     process: PEPROCESS,
+    _proc_id: HANDLE,
     info_ptr: *mut PS_CREATE_NOTIFY_INFO,
 ) {
-    // Exit events have NULL info_ptr
-    if info_ptr.is_null() {
-        return;
-    }
+    /*──── ignore exits ────*/
+    if info_ptr.is_null() { return; }
 
-    /*----------------------------- gather fields ----------------------------*/
-    let pid  = PsGetProcessId(process) as u32;
-    let ppid = PsGetProcessId(parent)  as u32;
+    /*──── gather fields ───*/
+    // SAFETY: kernel guarantees `process` is valid.
+    let pid = unsafe { PsGetProcessId(process) as u32 };
+    // Parent PID comes from the info struct.
+    let ppid = unsafe { (*info_ptr).ParentProcessId as u32 };
 
-    let info       = &*info_ptr;
-    let image_path = uni_to_string(info.ImageFileName);
-    let cmdline    = uni_to_string(info.CommandLine);
+    let info = unsafe { &*info_ptr };
+    let image_path = unsafe { uni_to_string(info.ImageFileName) };
+    let cmdline    = unsafe { uni_to_string(info.CommandLine) };
 
     // Timestamp
     let mut li = LARGE_INTEGER { QuadPart: 0 };
-    KeQuerySystemTimePrecise(&mut li);
+    // SAFETY: kernel API.
+    unsafe { KeQuerySystemTimePrecise(&mut li) };
     let ts = li_to_timestamp(li);
 
-    /*----------------------------- build messages ---------------------------*/
+    /*──── build protobuf ──*/
     let proc_evt = ProcessEvent { pid, ppid, image_path, cmdline };
     let base_evt = BaseEvent {
         ts: Some(ts),
@@ -111,14 +120,13 @@ unsafe extern "C" fn process_notify(
         payload: Some(base_event::Payload::ProcessEvent(proc_evt)),
     };
 
-    /*----------------------------- serialise & push -------------------------*/
-    let mut buf = Vec::<u8>::with_capacity(base_evt.encoded_len());
-    if base_evt.encode(&mut buf).is_err() {
-        return; // encoding failed → drop event
-    }
+    /*──── encode & push ───*/
+    let mut buf = Vec::with_capacity(base_evt.encoded_len());
+    if base_evt.encode(&mut buf).is_err() { return; }
 
-    let ring = RING;
+    // SAFETY: `RING` was set in `register`; aliased read only.
+    let ring = unsafe { RING };
     if !ring.is_null() {
-        (*ring).push_bytes(&buf);
+        unsafe { (*ring).push_bytes(&buf) };
     }
 }

@@ -79,7 +79,7 @@ impl KernelRingRouter {
 
     fn dispatch(&self, evt: BaseEvent) {
         let ts   = evt.ts.unwrap_or_else(|| SystemTime::now().into());
-        let guid = evt.sensor_guid; // stays the same for every payload
+        let guid = evt.sensor_guid;
 
         match evt.payload {
             Some(Payload::ProcessEvent(p))   =>

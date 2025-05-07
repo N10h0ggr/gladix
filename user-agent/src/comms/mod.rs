@@ -1,11 +1,17 @@
-
+//! `comms` – communication primitives
+//! ----------------------------------
+//! * `memory_ring`  → zero‑copy ring buffer shared with the kernel driver.
+//! * `router`       → splits BaseEvents coming from the ring.
+//! * `Buses`        → fan‑out channels (DB writer + realtime broadcast).
+//! * `WrappedEvent` → uniform envelope used by all internal pipelines.
 pub mod memory_ring;
 pub mod router;
 
 use prost_types::Timestamp;
 use tokio::sync::{broadcast, mpsc};
 
-/// Asegúrate de añadir este derive para que luego WrappedEvent<E>: Clone
+/// Uniform wrapper so every pipeline sees `{ts, sensor_guid, payload}`
+/// independent of the concrete protobuf message type.
 #[derive(Clone)]
 pub struct WrappedEvent<E: Clone>  {
     pub ts:          Timestamp,

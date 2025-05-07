@@ -3,7 +3,7 @@
 //! The kernel driver exposes a named section (`Global\MySharedSection`)
 //! that contains a *single‑producer / single‑consumer* byte ring:
 //
-//!   ┌──── 0                             size (64 KiB) ────┐
+//!   ┌──── 0                             size (64 KiB) ────┐
 //!   │ u32 write_off │   len | msg   len | msg   …        │
 //!   └─────────────────────────────────────────────────────┘
 //
