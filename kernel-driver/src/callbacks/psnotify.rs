@@ -1,11 +1,20 @@
-//! Process‑creation notify  →  `BaseEvent::ProcessEvent`
+//! kernel-driver/src/callbacks/psnotify.rs
 //!
-//! This kernel‑mode module registers a `PsSetCreateProcessNotifyRoutineEx`
-//! callback, turns every *process‑create* into a `shared::events::ProcessEvent`,
-//! wraps it in `BaseEvent`, serialises with `prost`, and pushes the raw bytes
-//! into the driver’s `MemoryRing`.
+//! This kernel-mode module registers a `PsSetCreateProcessNotifyRoutineEx`
+//! callback, turns every *process-create* into a `shared::events::ProcessEvent`,
+//! wraps it in `BaseEvent`, serialises with `prost`, and pushes a
+//! length-prefixed message into the driver’s `MemoryRing`.
 //!
-//! We ignore *process‑exit* notifications (`info_ptr == NULL`).
+//! Framing on the wire now looks like:
+//!   [u32 write_offset]
+//!   [u32 msg_len][ msg bytes… ]
+//!   [u32 msg_len][ msg bytes… ]
+//!   …
+//! where each `msg_len` is the little-endian byte-length of its following
+//! protobuf payload.  This makes the reader’s job trivial: read exactly
+//! `msg_len` bytes per `BaseEvent`.
+//!
+//! We ignore *process-exit* notifications (`info_ptr == NULL`).
 
 extern crate alloc;
 
@@ -13,7 +22,6 @@ use alloc::{string::String, vec::Vec};
 use core::{ptr, slice};
 
 use prost::Message;
-use prost_types::Timestamp;
 use shared::events::{base_event, BaseEvent, ProcessEvent};
 use wdk_sys::{
     HANDLE, LARGE_INTEGER, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
@@ -22,6 +30,7 @@ use wdk_sys::{
 };
 
 use crate::communications::memory_ring::MemoryRing;
+use crate::helpers::*;
 
 /*────────────────── constants ─────────────────*/
 
@@ -56,33 +65,6 @@ pub unsafe fn unregister() -> Result<(), NTSTATUS> {
     if st == STATUS_SUCCESS { Ok(()) } else { Err(st) }
 }
 
-/*────────────────── helpers ─────────────────*/
-
-/// Convert a `UNICODE_STRING*` to a Rust `String`.
-///
-/// # Safety
-/// `uni` must be a valid, initialised pointer from the kernel.
-unsafe fn uni_to_string(uni: *const UNICODE_STRING) -> String {
-    if uni.is_null() {
-        return String::new();
-    }
-    // SAFETY: caller guarantees pointer validity.
-    let u = unsafe { &*uni };
-    let len = (u.Length / 2) as usize;
-    // SAFETY: buffer points to `len` UTF‑16 code units.
-    let buf = unsafe { slice::from_raw_parts(u.Buffer, len) };
-    String::from_utf16_lossy(buf)
-}
-
-/// Convert 100‑ns Windows ticks to protobuf `Timestamp`.
-fn li_to_timestamp(li: LARGE_INTEGER) -> Timestamp {
-    // SAFETY: union field access.
-    let ticks = unsafe { li.QuadPart as i64 };
-    const WIN_TO_UNIX_SECS: i64 = 11_644_473_600;
-    let secs  = (ticks / 10_000_000) - WIN_TO_UNIX_SECS;
-    let nanos = ((ticks % 10_000_000) * 100) as i32;
-    Timestamp { seconds: secs, nanos }
-}
 
 /*────────────────── callback ─────────────────*/
 
@@ -97,9 +79,7 @@ unsafe extern "C" fn process_notify(
     if info_ptr.is_null() { return; }
 
     /*──── gather fields ───*/
-    // SAFETY: kernel guarantees `process` is valid.
     let pid = unsafe { PsGetProcessId(process) as u32 };
-    // Parent PID comes from the info struct.
     let ppid = unsafe { (*info_ptr).ParentProcessId as u32 };
 
     let info = unsafe { &*info_ptr };
@@ -121,8 +101,10 @@ unsafe extern "C" fn process_notify(
     };
 
     /*──── encode & push ───*/
-    let mut buf = Vec::with_capacity(base_evt.encoded_len());
-    if base_evt.encode(&mut buf).is_err() { return; }
+    let msg_len = base_evt.encoded_len() as u32;
+    let mut buf = Vec::with_capacity(4 + msg_len as usize);
+    buf.extend_from_slice(&msg_len.to_le_bytes());
+    base_evt.encode(&mut buf).unwrap();
 
     // SAFETY: `RING` was set in `register`; aliased read only.
     let ring = unsafe { RING };

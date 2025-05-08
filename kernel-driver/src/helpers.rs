@@ -1,12 +1,11 @@
 extern crate alloc;
+
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
-use wdk_sys::{
-    IRP,
-    NTSTATUS,
-    STATUS_INVALID_PARAMETER,
-    UNICODE_STRING,
-};
+use core::{ptr, slice};
+use prost_types::Timestamp;
+use wdk_sys::{HANDLE, IRP, LARGE_INTEGER, NTSTATUS, OBJECT_ATTRIBUTES, STATUS_INVALID_PARAMETER, UNICODE_STRING};
 use wdk_sys::PIO_STACK_LOCATION;
 
 unsafe extern "system" {
@@ -45,4 +44,58 @@ pub unsafe fn io_get_current_irp_stack_location(irp: *mut IRP) -> Result<PIO_STA
     }
     // Return a pointer to the field, so that the caller gets a pointer to a pointer.
     Ok((*irp).Tail.Overlay.__bindgen_anon_2.__bindgen_anon_1.CurrentStackLocation)
+}
+
+/// Convert a `UNICODE_STRING*` to a Rust `String`.
+///
+/// # Safety
+/// `uni` must be a valid, initialised pointer from the kernel.
+pub unsafe fn uni_to_string(uni: *const UNICODE_STRING) -> String {
+    if uni.is_null() {
+        return String::new();
+    }
+    // SAFETY: caller guarantees pointer validity.
+    let u = unsafe { &*uni };
+    let len = (u.Length / 2) as usize;
+    // SAFETY: buffer points to `len` UTF‑16 code units.
+    let buf = unsafe { slice::from_raw_parts(u.Buffer, len) };
+    String::from_utf16_lossy(buf)
+}
+
+/// Convert 100‑ns Windows ticks to protobuf `Timestamp`.
+pub fn li_to_timestamp(li: LARGE_INTEGER) -> Timestamp {
+    // SAFETY: union field access.
+    let ticks = unsafe { li.QuadPart as i64 };
+    const WIN_TO_UNIX_SECS: i64 = 11_644_473_600;
+    let secs  = (ticks / 10_000_000) - WIN_TO_UNIX_SECS;
+    let nanos = ((ticks % 10_000_000) * 100) as i32;
+    Timestamp { seconds: secs, nanos }
+}
+
+/// Rust equivalent of `InitializeObjectAttributes`.
+///
+/// # Safety
+/// Caller must provide writable, valid pointers.
+pub unsafe fn initialize_object_attributes(
+    obj:  *mut OBJECT_ATTRIBUTES,
+    name: *mut UNICODE_STRING,
+    attrs: u32,
+    root: HANDLE,
+    sd:   *mut core::ffi::c_void,
+) {
+    unsafe {
+        (*obj).Length = core::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+        (*obj).RootDirectory = root;
+        (*obj).Attributes = attrs;
+        (*obj).ObjectName = name;
+        (*obj).SecurityDescriptor = sd;
+        (*obj).SecurityQualityOfService = ptr::null_mut();
+
+    }
+}
+
+// Handle of the current process
+#[inline]
+pub fn nt_current_process() -> HANDLE {
+    (-1isize) as HANDLE
 }

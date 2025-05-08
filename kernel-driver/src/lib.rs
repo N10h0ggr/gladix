@@ -23,19 +23,19 @@ use shared::constants::{RING_SIZE, RING_NAME};
 #[global_allocator]
 static ALLOCATOR: WdkAllocator = WdkAllocator;
 
-/*---------------- modules ----------------*/
+/*---------------- modules ----------------*/
 mod communications;
 mod callbacks;   // psnotify
 mod dispatch;
 mod helpers;
-mod consts;
+mod security;
 
 use communications::memory_ring::{MemoryRing};
 use callbacks::psnotify;
 use dispatch::*;
 use helpers::*;
 
-/*---------------- globals ----------------*/
+/*---------------- globals ----------------*/
 static mut DISPATCHER: Dispatcher = Dispatcher::new();
 
 //
@@ -48,7 +48,7 @@ pub struct DeviceExtension {
     ring_ptr: *mut MemoryRing,
 }
 
-/*---------------- DriverEntry ----------------*/
+/*---------------- DriverEntry ----------------*/
 
 
 #[unsafe(no_mangle)]         // exports "DriverEntry"
@@ -69,7 +69,6 @@ pub unsafe extern "C" fn DriverEntry(
     let ring_ref = unsafe { &*raw_ring };
 
     /* 2 ─ process‑notify callback ------------------------------------------*/
-    // TODO: Check if process_notify function is beeing called
     if let Err(st) = unsafe { psnotify::register(ring_ref) } {
         unsafe { drop(Box::from_raw(raw_ring)); }
         return st;
@@ -86,7 +85,7 @@ pub unsafe extern "C" fn DriverEntry(
             &dev_name as *const _ as _,
             FILE_DEVICE_UNKNOWN,
             0,
-            0u8,                       // exclusive = FALSE
+            0u8,
             &mut dev_obj,
         )
     };
