@@ -5,7 +5,6 @@
 //! * `Buses`        → fan‑out channels (DB writer + realtime broadcast).
 //! * `WrappedEvent` → uniform envelope used by all internal pipelines.
 pub mod memory_ring;
-pub mod router;
 
 use prost_types::Timestamp;
 use tokio::sync::{broadcast, mpsc};
@@ -20,12 +19,12 @@ pub struct WrappedEvent<E: Clone>  {
 }
 
 #[derive(Clone)]
-pub struct Buses<E: Clone + Send + 'static> {
+pub struct TokioBuses<E: Clone + Send + 'static> {
     pub db_tx:    mpsc::Sender<WrappedEvent<E>>,
     pub intel_tx: broadcast::Sender<WrappedEvent<E>>,
 }
 
-impl<E: Clone + Send + 'static> Buses<E> {
+impl<E: Clone + Send + 'static> TokioBuses<E> {
     pub fn new(db_capacity: usize, intel_capacity: usize) -> Self {
         let (db_tx, _)    = mpsc::channel(db_capacity);
         let (intel_tx, _) = broadcast::channel(intel_capacity);

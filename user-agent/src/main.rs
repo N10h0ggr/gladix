@@ -43,18 +43,18 @@ use shared::events::{
 };
 use crate::{
     comms::{
-        memory_ring::MemoryRing,
-        router::KernelRingRouter,
-        Buses,
+        memory_ring::{spawn_ring_consumer, MemoryRingBuses, MemoryRing},
+        TokioBuses,
         WrappedEvent,
     },
     config::{load, Config},
+    db::{
+        connection::{init_database, open_db_connection, db_path},
+        maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance},
+        spawn_writer,
+    }
 };
-use db::{
-    connection::{init_database, open_db_connection, db_path},
-    maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance},
-    spawn_writer,
-};
+
 use metrics_exporter_prometheus::PrometheusBuilder;
 use scanner::run_scanner;
 
@@ -130,7 +130,7 @@ fn make_buses_with_writer<E>(
     exe_dir: &Path,
     db_cfg: &config::model::DatabaseConfig,
     tag: &'static str,
-) -> Buses<E>
+) -> TokioBuses<E>
 where
     E: Clone + Send + 'static,
     WrappedEvent<E>: db::batch_inserts::BatchInsert<WrappedEvent<E>>,
@@ -142,7 +142,7 @@ where
     spawn_writer(rt, conn, db_rx, db_cfg);
 
     let (intel_tx, _) = broadcast::channel::<WrappedEvent<E>>(1_024);
-    Buses { db_tx, intel_tx }
+    TokioBuses { db_tx, intel_tx }
 }
 
 /*──────────────────────────── main service routine ────────────────────────*/
@@ -169,21 +169,20 @@ fn run_service() {
     /* 5 ▸ Tokio runtime + async DB writers */
     let rt = Runtime::new().expect("Tokio runtime failed");
 
-    let process_buses = make_buses_with_writer::<ProcessEvent>(&rt, &exe_dir, db_cfg, "process");
-    let file_buses    = make_buses_with_writer::<FileEvent   >(&rt, &exe_dir, db_cfg, "file");
-    let net_buses     = make_buses_with_writer::<NetworkEvent>(&rt, &exe_dir, db_cfg, "net");
-    let etw_buses     = make_buses_with_writer::<EtwEvent    >(&rt, &exe_dir, db_cfg, "etw");
+    let process = make_buses_with_writer::<ProcessEvent>(&rt, &exe_dir, db_cfg, "process");
+    let file    = make_buses_with_writer::<FileEvent   >(&rt, &exe_dir, db_cfg, "file");
+    let net     = make_buses_with_writer::<NetworkEvent>(&rt, &exe_dir, db_cfg, "net");
+    let etw     = make_buses_with_writer::<EtwEvent    >(&rt, &exe_dir, db_cfg, "etw");
 
+    let buses = MemoryRingBuses {
+        process: process.clone(),
+        file   : file.clone(),
+        net    : net.clone(),
+        etw    : etw.clone(),
+    };
 
-    /* 5a ▸ Ring‑buffer router */
-    let ring = MemoryRing::open()
-        .unwrap_or_else(|e| fatal!("ring", "cannot open shared ring: {e}"));
-    Arc::new(KernelRingRouter::new(
-        ring,
-        Some(process_buses.clone()), // current usage
-        None,                        // ImageLoadEvent – coming soon
-        None,                        // ObjectOpEvent  – coming soon
-    )).spawn();
+    let ring = MemoryRing::open().unwrap_or_else(|e| fatal!("ring", "{e}"));
+    spawn_ring_consumer(&rt, ring, buses);
 
     /* 5b ▸ SQLite maintenance tasks */
     spawn_ttl_cleanup(&rt, db_path_on_disk.clone(), db_cfg);

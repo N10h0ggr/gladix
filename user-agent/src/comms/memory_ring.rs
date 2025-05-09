@@ -23,6 +23,8 @@ use std::{
     slice,
     sync::atomic::{AtomicU32, Ordering},
 };
+use std::time::Duration;
+use tokio::runtime::Runtime;
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
     System::Memory::{
@@ -30,103 +32,233 @@ use windows_sys::Win32::{
         MEMORY_MAPPED_VIEW_ADDRESS,
     },
 };
+use shared::events::{BaseEvent, EtwEvent, FileEvent, NetworkEvent, ProcessEvent};
+use shared::events::{base_event::Payload};
+use prost::Message;
+use prost_types::Timestamp;
+use tokio::time::sleep;
+use windows_sys::Win32::System::Memory::FILE_MAP_ALL_ACCESS;
 
-/// Section name chosen by the kernel driver (`ZwCreateSection`).
-const SECTION_NAME: &str = r"Global\MySharedSection";
-/// Size used by the driver (power‑of‑two simplifies wrap logic).
-const RING_SIZE:     usize = 64 * 1024;
+use super::{TokioBuses, WrappedEvent};
 
-/// Thin RAII wrapper: maps the driver’s section on construction,
-/// unmaps/close on drop.
-pub struct MemoryRing {
-    handle: HANDLE,                     // duplicated kernel section handle
-    view:   MEMORY_MAPPED_VIEW_ADDRESS, // returned by MapViewOfFile (needed for unmap)
-    base:   *mut u8,                    // raw pointer for fast offset arithmetic
-    size:   usize,                      // == RING_SIZE
+
+/* ───────────────────────── Ring mapping ─────────────────────────── */
+const SECTION_NAME: &str = r"Global\GladixSharedSection";
+
+#[repr(C)]
+struct Header {
+    head:    AtomicU32,
+    tail:    AtomicU32,
+    dropped: AtomicU32,
+    size:    u32,
 }
 
-// Safe because we never mutate shared memory concurrently from multiple threads.
+/// Single‑producer / single‑consumer ring reader.
+/// Safe because we keep one instance per task.
+pub struct MemoryRing {
+    handle: HANDLE,
+    view:   MEMORY_MAPPED_VIEW_ADDRESS,
+    hdr:    *mut Header,
+    data:   *mut u8,
+    size:   u32,
+    tail:   u32,
+}
+
 unsafe impl Send for MemoryRing {}
 unsafe impl Sync for MemoryRing {}
 
 impl MemoryRing {
-    /// Try to open and map the named section (read‑only).
     pub fn open() -> io::Result<Self> {
-        // Build null‑terminated UTF‑16 string for Win32 API
-        let wide: Vec<u16> = OsStr::new(SECTION_NAME)
-            .encode_wide()
-            .chain(Some(0))     // NUL
-            .collect();
+        let wide: Vec<u16> =
+            OsStr::new(SECTION_NAME).encode_wide().chain(Some(0)).collect();
 
-        // OpenFileMappingW returns a HANDLE we must close later
-        let handle = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
+        let handle =
+            unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide.as_ptr()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
 
-        // MapViewOfFile → shared memory in our process
-        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, RING_SIZE) };
+        let view =
+            unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
         if view.Value.is_null() {
             unsafe { CloseHandle(handle) };
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Self {
-            handle,
-            view,
-            base: view.Value as *mut u8,
-            size: RING_SIZE,
-        })
+        // 4‑byte aligned now → safe to take references
+        let hdr  = view.Value as *mut Header;
+        let size = unsafe { (*hdr).size };
+        let data =
+            unsafe { (hdr as *mut u8).add(std::mem::size_of::<Header>()) };
+        let tail = unsafe { (*hdr).tail.load(Ordering::Acquire) };
+
+        Ok(Self { handle, view, hdr, data, size, tail })
     }
 
-    /// Return the next complete message, *if* the writer has already published it.
-    /// Non‑blocking: returns `None` when there is no new data.
-    pub fn next(&self) -> Option<Vec<u8>> {
-        /* ── 1 ▸ observe producer cursor (Acquire) ────────────────────────── */
-        let write_of = unsafe {
-            (self.base as *const AtomicU32)
-                .as_ref()?
-                .load(Ordering::Acquire)
-        } as usize;
-        if write_of < 4 { return None }          // writer hasn’t initialised yet
-
-        /* ── 2 ▸ reader cursor lives in static mut ───────────────────────── */
-        static mut READ_OF: usize = 4;           // start right after write_off
-        let mut ro = unsafe { READ_OF };
-        if ro == write_of { return None }        // already up‑to‑date
-
-        /* ── 3 ▸ wrap if reaching end ────────────────────────────────────── */
-        if ro + 4 > self.size { ro = 4; }
-
-        /* ── 4 ▸ read length prefix (unaligned) ───────────────────────────── */
-        let len = unsafe { ptr::read_unaligned(self.base.add(ro) as *const u32) } as usize;
-        if len == 0 || len > (self.size - 4) {
-            // Corrupted length → resynchronise
-            unsafe { READ_OF = 4 };
+    /// Returns the next complete protobuf blob – `None` if producer caught up.
+    pub fn next(&mut self) -> Option<Vec<u8>> {
+        let head = unsafe { (*self.hdr).head.load(Ordering::Acquire) };
+        if self.tail == head {
             return None;
         }
 
-        /* ── 5 ▸ ensure full message already written ─────────────────────── */
-        if ro + 4 + len > write_of { return None } // writer still working
+        /* 1 ▸ read little‑endian length (may wrap) */
+        let len = {
+            let mut tmp = [0u8; 4];
+            self.copy_circular(self.tail, &mut tmp);
+            u32::from_le_bytes(tmp)
+        };
+        if len == 0 || len > self.size - 4 {
+            // corruption → resync to producer tail
+            self.tail = head;
+            unsafe { (*self.hdr).tail.store(self.tail, Ordering::Release) };
+            return None;
+        }
 
-        /* ── 6 ▸ copy out & advance cursor ───────────────────────────────── */
-        let src = unsafe { slice::from_raw_parts(self.base.add(ro + 4), len) };
-        let mut buf = vec![0u8; len];
-        buf.copy_from_slice(src);
+        /* 2 ▸ full payload already written? */
+        let avail = if self.tail <= head {
+            head - self.tail
+        } else {
+            self.size - self.tail + head
+        };
+        if avail < len + 4 {
+            return None; // producer still writing it
+        }
 
-        ro += 4 + len;
-        if ro >= self.size { ro = 4; }
-        unsafe { READ_OF = ro };
+        /* 3 ▸ copy out */
+        let mut buf = vec![0u8; len as usize];
+        self.copy_circular(self.tail.wrapping_add(4), &mut buf);
+
+        /* 4 ▸ advance + publish new tail */
+        self.tail = (self.tail + 4 + len) % self.size;
+        unsafe { (*self.hdr).tail.store(self.tail, Ordering::Release) };
 
         Some(buf)
+    }
+
+    #[inline]
+    fn copy_circular(&self, mut off: u32, dst: &mut [u8]) {
+        let size = self.size as usize;
+        let data = self.data as *const u8;
+        let mut rem = dst.len();
+        let mut pos = 0;
+
+        while rem != 0 {
+            let chunk = rem.min(size - off as usize);
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    data.add(off as usize),
+                    dst.as_mut_ptr().add(pos),
+                    chunk,
+                );
+            }
+            rem -= chunk;
+            pos += chunk;
+            off = (off + chunk as u32) % self.size;
+        }
     }
 }
 
 impl Drop for MemoryRing {
     fn drop(&mut self) {
         unsafe {
-            UnmapViewOfFile(self.view); // unmap first
-            CloseHandle(self.handle);   // then close handle
+            UnmapViewOfFile(self.view);
+            CloseHandle(self.handle);
         }
     }
+}
+
+/* ────────────────────── bus fan‑out (macro) ─────────────────────── */
+
+/// One entry per concrete payload:
+///     field_name => PayloadVariant( RustType )
+///
+/// *Add a new line here when you grow the protobuf schema.*
+macro_rules! define_memory_ring_buses {
+    (
+        $( $field:ident => $variant:ident ( $typ:ty ) ),+ $(,)?
+    ) => {
+        /// `MemoryRingBuses` holds the pair `{db_tx, intel_tx}` for *each* payload.
+        #[derive(Clone)]
+        pub struct MemoryRingBuses {
+            $( pub $field: super::TokioBuses<$typ>, )+
+        }
+
+        impl MemoryRingBuses {
+            /// Send a fully‑typed `WrappedEvent` to the correct bus.
+            async fn dispatch(
+                &self,
+                ts: Timestamp,
+                sensor_guid: String,
+                payload: Payload,
+            ) {
+                match payload {
+                    $(
+                        Payload::$variant(inner) => {
+                            let event = super::WrappedEvent {
+                                ts,
+                                sensor_guid,
+                                payload: inner,
+                            };
+                            // db writer
+                            let _ = self.$field.db_tx.send(event.clone()).await;
+                            // realtime broadcast
+                            let _ = self.$field.intel_tx.send(event);
+                        }
+                    )+
+                    other => {
+                        log::warn!("ring: unhandled payload variant {:?}", other);
+                    }
+                }
+            }
+        }
+    };
+}
+
+/*  ←──── Add new event types here ─────────────────────────────────── */
+define_memory_ring_buses! {
+    process => ProcessEvent(ProcessEvent),
+    file    => FileEvent   (FileEvent),
+    net     => NetworkEvent(NetworkEvent),
+    etw     => EtwEvent    (EtwEvent),
+}
+
+/* ─────────────────────── poll‑loop spawner ──────────────────────── */
+
+/// Spawn one Tokio task that
+///   • drains *all* currently‑available events in a burst;
+///   • sleeps 1ms when the ring is empty (bounded latency, no busy‑loop);
+///   • wraps & dispatches each payload to its `TokioBuses`.
+pub fn spawn_ring_consumer(
+    rt: &Runtime,
+    mut ring: MemoryRing,
+    buses: MemoryRingBuses,
+) {
+    rt.spawn(async move {
+        loop {
+            let mut drained = false;
+
+            while let Some(raw) = ring.next() {
+                drained = true;
+
+                match BaseEvent::decode(&*raw) {
+                    Ok(evt) => {
+                        if let Some(payload) = evt.payload {
+                            let ts = evt.ts.unwrap_or_default();
+                            buses
+                                .dispatch(ts, evt.sensor_guid, payload)
+                                .await;
+                        } else {
+                            log::warn!("ring: BaseEvent without payload");
+                        }
+                    }
+                    Err(e) => log::error!("ring: protobuf decode error: {e}"),
+                }
+            }
+
+            if !drained {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+    });
 }
