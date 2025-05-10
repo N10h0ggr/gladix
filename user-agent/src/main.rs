@@ -55,6 +55,8 @@ use crate::{
     }
 };
 
+#[macro_use]
+extern crate metrics;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use scanner::run_scanner;
 
@@ -133,6 +135,7 @@ where
     let conn = init_database(exe_dir, db_cfg)
         .unwrap_or_else(|e| fatal!("[make_buses_with_writer()]: {}", e));
 
+    // TODO: Maybe change to use new() instead?
     let (db_tx, db_rx) = async_mpsc::channel::<WrappedEvent<E>>(10_000);
     spawn_writer(rt, conn, db_rx, db_cfg);
 
@@ -171,7 +174,7 @@ fn run_service() {
     let etw     = make_buses_with_writer::<EtwEvent>(&rt, &exe_dir, db_cfg,);
     log::info!("run_service(): TokioBuses ready");
 
-    let buses = MemoryRingBuses {
+    let memory_ring_buses = MemoryRingBuses {
         process: process.clone(),
         file   : file.clone(),
         net    : net.clone(),
@@ -181,7 +184,7 @@ fn run_service() {
     let ring = MemoryRing::open().unwrap_or_else(|e| fatal!("run_service(): Error opening the ring: {}", e));
     log::info!("run_service(): Ring ready");
 
-    spawn_ring_consumer(&rt, ring, buses);
+    spawn_ring_consumer(&rt, ring, memory_ring_buses);
     log::info!("run_service(): Ring consumers ready");
 
     // SQLite maintenance tasks

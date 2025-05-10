@@ -4,6 +4,19 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA journal_size_limit = 52428800;  -- ~50MB
 
+-- Process creation events table
+CREATE TABLE IF NOT EXISTS process_events (
+    id          INTEGER PRIMARY KEY,
+    ts          INTEGER NOT NULL,
+    sensor_guid TEXT,
+    pid         INTEGER NOT NULL,
+    ppid        INTEGER,
+    image_path  TEXT NOT NULL,
+    cmdline     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_process_events_ts  ON process_events(ts);
+CREATE INDEX IF NOT EXISTS idx_process_events_pid ON process_events(pid);
+
 -- Filesystem events table
 CREATE TABLE IF NOT EXISTS fs_events (
     id          INTEGER PRIMARY KEY,

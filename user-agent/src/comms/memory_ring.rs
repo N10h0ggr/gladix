@@ -26,6 +26,7 @@ use std::{
 };
 use log::{info, debug, error, warn};
 use std::time::Duration;
+use metrics::{counter, histogram};
 use tokio::runtime::Runtime;
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
@@ -255,6 +256,10 @@ macro_rules! define_memory_ring_buses {
                                 sensor_guid,
                                 payload: inner,
                             };
+                             counter!(
+                                "events_total",
+                                "payload" => stringify!($variant)
+                            ).increment(1);
                             // db writer
                             let _ = self.$field.db_tx.send(event.clone()).await;
                             // realtime broadcast
@@ -309,6 +314,7 @@ pub fn spawn_ring_consumer(
                         }
                     }
                     Err(e) => {
+                        counter!("evt_decode_error_total").increment(1);
                         log::error!(
                             "ring: protobuf decode error: {e}; raw[0..16]={:02x?} (len={})",
                             &raw[..raw.len().min(16)],
@@ -318,8 +324,12 @@ pub fn spawn_ring_consumer(
                 }
             }
 
+            // TODO: Implement adaptive backoff strategy:
+            // - Reset sleep to a low value (e.g., 10 ms) after draining events.
+            // - Gradually increase sleep (e.g., exponential backoff) when no events are found.
+            // - Cap the sleep duration (e.g., max 1000 ms) to balance latency and CPU usage.
             if !drained {
-                sleep(Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(500)).await;
             }
         }
     });

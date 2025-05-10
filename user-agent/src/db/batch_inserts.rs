@@ -121,11 +121,12 @@ impl BatchInsert<WrappedEvent<EtwEvent>> for WrappedEvent<EtwEvent> {
 }
 
 
+/// PROCESS EVENTS: WrappedEvent<ProcessEvent>
 impl BatchInsert<WrappedEvent<ProcessEvent>> for WrappedEvent<ProcessEvent> {
     fn insert_sql() -> &'static str {
-        "INSERT INTO etw_events \
+        "INSERT INTO process_events \
          (ts, sensor_guid, pid, ppid, image_path, cmdline) \
-         VALUES (?1,?2,?3,?4,?5,?6)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
     }
 
     fn bind_and_execute(stmt: &mut Statement<'_>, rec: &WrappedEvent<ProcessEvent>) -> SqlResult<()> {
@@ -136,7 +137,7 @@ impl BatchInsert<WrappedEvent<ProcessEvent>> for WrappedEvent<ProcessEvent> {
         stmt.execute(params![
             ts,
             sensor,
-            ev.pid,
+            ev.pid as i64,
             ev.ppid as i64,
             &ev.image_path,
             &ev.cmdline,
@@ -144,4 +145,3 @@ impl BatchInsert<WrappedEvent<ProcessEvent>> for WrappedEvent<ProcessEvent> {
         Ok(())
     }
 }
-
