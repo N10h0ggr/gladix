@@ -19,7 +19,7 @@ use wdk_sys::{
 };
 use wdk_sys::ntddk::{IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink};
 
-use shared::constants::{RING_SIZE, RING_NAME};
+use shared::constants::{SHARED_SECTION_SIZE, KERNEL_SHARED_SECTION_NAME};
 #[global_allocator]
 static ALLOCATOR: WdkAllocator = WdkAllocator;
 
@@ -60,7 +60,7 @@ pub unsafe extern "C" fn DriverEntry(
 
     /* 1 ─ ring section ------------------------------------------------------*/
     // TODO: Handle when Shared Section already exists.
-    let raw_ring  = match MemoryRing::create(RING_NAME, RING_SIZE)
+    let raw_ring  = match MemoryRing::create(KERNEL_SHARED_SECTION_NAME, SHARED_SECTION_SIZE)
         .and_then(|mut r| { r.map()?; Ok(r) })
     {
         Ok(r) => Box::into_raw(Box::new(r)),

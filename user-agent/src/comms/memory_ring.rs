@@ -7,10 +7,11 @@
 //!   │ u32 write_off │   len | msg   len | msg   …        │
 //!   └─────────────────────────────────────────────────────┘
 //
-//! * `write_off` **always** moves forward; the writer wraps to 4 whenever the
-//!   next message would cross the buffer end.
-//! * Each message is length‑prefixed (`u32`, little‑endian, unaligned).
-//! * Reader keeps its own cursor (`READ_OF`, in process memory).
+//! `write_off` **always** moves forward; the writer wraps to 4 whenever the
+//!  next message would cross the buffer end.
+//! The kernel writes events as: [u32 length][protobuf payload]
+//! The reader skips 4 bytes and decodes the payload with `prost`.
+//! Reader keeps its own cursor (`READ_OF`, in process memory).
 //!
 //! This file maps the section READ‑ONLY and provides `next()` which returns the
 //! next complete protobuf blob (if any).
@@ -23,6 +24,7 @@ use std::{
     slice,
     sync::atomic::{AtomicU32, Ordering},
 };
+use log::{info, debug, error, warn};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use windows_sys::Win32::{
@@ -34,16 +36,17 @@ use windows_sys::Win32::{
 };
 use shared::events::{BaseEvent, EtwEvent, FileEvent, NetworkEvent, ProcessEvent};
 use shared::events::{base_event::Payload};
+use shared::constants::USER_SHARED_SECTION_NAME;
 use prost::Message;
 use prost_types::Timestamp;
 use tokio::time::sleep;
+use windows_sys::Win32::Foundation::BOOL;
 use windows_sys::Win32::System::Memory::FILE_MAP_ALL_ACCESS;
 
 use super::{TokioBuses, WrappedEvent};
 
 
 /* ───────────────────────── Ring mapping ─────────────────────────── */
-const SECTION_NAME: &str = r"Global\GladixSharedSection";
 
 #[repr(C)]
 struct Header {
@@ -69,29 +72,56 @@ unsafe impl Sync for MemoryRing {}
 
 impl MemoryRing {
     pub fn open() -> io::Result<Self> {
-        let wide: Vec<u16> =
-            OsStr::new(SECTION_NAME).encode_wide().chain(Some(0)).collect();
+        // 1) Log the name we’re about to open
+        info!(target: "ring", " Opening shared section `{}`", USER_SHARED_SECTION_NAME);
 
-        let handle =
-            unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide.as_ptr()) };
+        // 2) Build a null-terminated UTF-16 version of that name
+        let wide: Vec<u16> = OsStr::new(USER_SHARED_SECTION_NAME)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        debug!(target: "ring", "   wide name: {:?} (len={})", &wide, wide.len());
+
+        // 3) Call OpenFileMappingW
+        let handle: HANDLE = unsafe {
+            OpenFileMappingW(
+                FILE_MAP_ALL_ACCESS,
+                0 as windows_sys::Win32::Foundation::BOOL,            // FALSE for “inherit handle”
+                wide.as_ptr().into(), // ensure we get a PCWSTR
+            )
+        };
         if handle.is_null() {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            error!(target: "ring", "OpenFileMappingW failed: {:?}", err);
+            return Err(err);
         }
+        debug!(target: "ring", " OpenFileMappingW OK — handle={:?}", handle);
 
-        let view =
-            unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+        // 4) Map the view
+        let view = unsafe {
+            MapViewOfFile(
+                handle,
+                FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                0, // map entire section
+            )
+        };
         if view.Value.is_null() {
+            let err = io::Error::last_os_error();
+            error!(target: "ring", " MapViewOfFile failed: {:?}", err);
             unsafe { CloseHandle(handle) };
-            return Err(io::Error::last_os_error());
+            return Err(err);
         }
+        debug!(target: "ring", " MapViewOfFile OK — ptr={:?}", view.Value);
 
-        // 4‑byte aligned now → safe to take references
+        // 5) Peel off header & pointers
         let hdr  = view.Value as *mut Header;
         let size = unsafe { (*hdr).size };
-        let data =
-            unsafe { (hdr as *mut u8).add(std::mem::size_of::<Header>()) };
+        let data = unsafe { (hdr as *mut u8).add(std::mem::size_of::<Header>()) };
         let tail = unsafe { (*hdr).tail.load(Ordering::Acquire) };
 
+        info!(target: "ring", "Shared section opened: size={} tail={}", size, tail);
         Ok(Self { handle, view, hdr, data, size, tail })
     }
 
@@ -102,14 +132,28 @@ impl MemoryRing {
             return None;
         }
 
+        debug!(
+            target: "ring",
+            "Reading frame: head={} tail={} buffer_size={}",
+            head, self.tail, self.size
+        );
+
         /* 1 ▸ read little‑endian length (may wrap) */
         let len = {
             let mut tmp = [0u8; 4];
             self.copy_circular(self.tail, &mut tmp);
             u32::from_le_bytes(tmp)
         };
+
+        debug!(target: "ring", "Length prefix at offset {}: len={}", self.tail, len);
+
         if len == 0 || len > self.size - 4 {
             // corruption → resync to producer tail
+            warn!(
+                target: "ring",
+                "Corrupt or invalid frame length detected: len={}, tail={}, head={}. Skipping to head.",
+                len, self.tail, head
+            );
             self.tail = head;
             unsafe { (*self.hdr).tail.store(self.tail, Ordering::Release) };
             return None;
@@ -122,6 +166,10 @@ impl MemoryRing {
             self.size - self.tail + head
         };
         if avail < len + 4 {
+            debug!(
+                target: "ring",
+                "Not enough data yet: needed={} available={}", len + 4, avail
+            );
             return None; // producer still writing it
         }
 
@@ -132,6 +180,13 @@ impl MemoryRing {
         /* 4 ▸ advance + publish new tail */
         self.tail = (self.tail + 4 + len) % self.size;
         unsafe { (*self.hdr).tail.store(self.tail, Ordering::Release) };
+
+        debug!(
+            target: "ring",
+            "Frame read OK: consumed {} bytes (tail -> {})",
+            4 + len,
+            self.tail
+        );
 
         Some(buf)
     }
@@ -243,6 +298,7 @@ pub fn spawn_ring_consumer(
 
                 match BaseEvent::decode(&*raw) {
                     Ok(evt) => {
+                        debug!(target: "ring", "Decoded BaseEvent: {:?}", evt);
                         if let Some(payload) = evt.payload {
                             let ts = evt.ts.unwrap_or_default();
                             buses
@@ -252,12 +308,18 @@ pub fn spawn_ring_consumer(
                             log::warn!("ring: BaseEvent without payload");
                         }
                     }
-                    Err(e) => log::error!("ring: protobuf decode error: {e}"),
+                    Err(e) => {
+                        log::error!(
+                            "ring: protobuf decode error: {e}; raw[0..16]={:02x?} (len={})",
+                            &raw[..raw.len().min(16)],
+                            raw.len()
+                        );
+                    }
                 }
             }
 
             if !drained {
-                sleep(Duration::from_millis(1)).await;
+                sleep(Duration::from_millis(100)).await;
             }
         }
     });

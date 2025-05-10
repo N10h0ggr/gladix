@@ -9,7 +9,8 @@ pub fn db_path(exe_dir: &Path, cfg: &DatabaseConfig) -> PathBuf {
     exe_dir.join(&cfg.path)
 }
 
-pub fn open_db_connection(path: &Path, cfg: &DatabaseConfig) -> rusqlite::Result<Connection> {
+// private helper for `init_database`
+fn open_db_connection(path: &Path, cfg: &DatabaseConfig) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_millis(1_000))?;
     conn.pragma_update(None, "journal_mode", &"WAL")?;
@@ -17,6 +18,8 @@ pub fn open_db_connection(path: &Path, cfg: &DatabaseConfig) -> rusqlite::Result
     Ok(conn)
 }
 
+/// Public: open-or-create the DB at `exe_dir.join(cfg.path)`, apply pragmas,
+/// purge on restart, and run `schema.sql` on first run.
 pub fn init_database(exe_dir: &Path, cfg: &DatabaseConfig) -> rusqlite::Result<Connection> {
     let path = db_path(exe_dir, cfg);
 
@@ -32,6 +35,5 @@ pub fn init_database(exe_dir: &Path, cfg: &DatabaseConfig) -> rusqlite::Result<C
         let schema = include_str!("../../resources/schema.sql");
         conn.execute_batch(schema)?;
     }
-    log::info!("Database ready at {}", path.display());
     Ok(conn)
 }

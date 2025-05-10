@@ -101,9 +101,7 @@ unsafe extern "C" fn process_notify(
     };
 
     /*──── encode & push ───*/
-    let msg_len = base_evt.encoded_len() as u32;
-    let mut buf = Vec::with_capacity(4 + msg_len as usize);
-    buf.extend_from_slice(&msg_len.to_le_bytes());
+    let mut buf = Vec::with_capacity(base_evt.encoded_len() as usize);
     base_evt.encode(&mut buf).unwrap();
 
     // SAFETY: `RING` was set in `register`; aliased read only.

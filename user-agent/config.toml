@@ -3,7 +3,7 @@
 # ─── Logging ─────────────────────────────────────────────
 [logging]
 enable = true
-file   = "logs/agent.log"
+file   = "agent.log"
 level  = "DEBUG"
 
 # ─── Database ────────────────────────────────────────────

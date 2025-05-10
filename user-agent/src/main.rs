@@ -23,7 +23,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process,
-    sync::{mpsc, Arc},
+    sync::{mpsc},
     thread,
     time::Duration,
 };
@@ -49,7 +49,7 @@ use crate::{
     },
     config::{load, Config},
     db::{
-        connection::{init_database, open_db_connection, db_path},
+        connection::{init_database, db_path},
         maintenance::{spawn_ttl_cleanup, spawn_wal_maintenance},
         spawn_writer,
     }
@@ -64,13 +64,9 @@ define_windows_service!(ffi_service_main, service_main);
 
 /// One‑liner helper for fatal errors (bypasses the logger so it works early).
 macro_rules! fatal {
-    ($ctx:expr, $($arg:tt)+) => {{
-        eprintln!(
-            "[{}][ERROR][{}] {}",
-            Local::now().to_rfc3339(),
-            $ctx,
-            format!($($arg)+)
-        );
+    ($($arg:tt)+) => {{
+        let msg = format!($($arg)+);
+        log::error!("Fatal error occurred in {}. Exiting...", msg);
         std::process::exit(1);
     }};
 }
@@ -129,14 +125,13 @@ fn make_buses_with_writer<E>(
     rt: &Runtime,
     exe_dir: &Path,
     db_cfg: &config::model::DatabaseConfig,
-    tag: &'static str,
 ) -> TokioBuses<E>
 where
     E: Clone + Send + 'static,
     WrappedEvent<E>: db::batch_inserts::BatchInsert<WrappedEvent<E>>,
 {
-    let conn = open_db_connection(exe_dir, db_cfg)
-        .unwrap_or_else(|e| fatal!(tag, "db open: {e}"));
+    let conn = init_database(exe_dir, db_cfg)
+        .unwrap_or_else(|e| fatal!("[make_buses_with_writer()]: {}", e));
 
     let (db_tx, db_rx) = async_mpsc::channel::<WrappedEvent<E>>(10_000);
     spawn_writer(rt, conn, db_rx, db_cfg);
@@ -151,11 +146,11 @@ fn run_service() {
     /* 1 ▸ Load configuration  */
     let exe_dir = exe_dir();
     let cfg = load(&exe_dir.join("config.toml"))
-        .unwrap_or_else(|e| fatal!("config", "{}", e));
+        .unwrap_or_else(|e| fatal!("run_service(): config: {}", e ));
 
     /* 2 ▸ Logging  */
     setup_logging(&cfg, &exe_dir).expect("Logging setup failed");
-    log::info!("Service bootstrap initiated");
+    log::info!("run_service(): Service bootstrap initiated");
 
     /* 3 ▸ Prometheus registry */
     let _prom = PrometheusBuilder::new().install();
@@ -164,15 +159,17 @@ fn run_service() {
     let db_cfg = &cfg.database;
     let db_path_on_disk = db_path(&exe_dir, db_cfg);
     init_database(&exe_dir, db_cfg)
-        .unwrap_or_else(|e| fatal!("database", "{e}"));
+        .unwrap_or_else(|e| fatal!("run_service(): database: {}", e));
+    log::info!("run_service(): Database ready at {}", exe_dir.display());
 
     /* 5 ▸ Tokio runtime + async DB writers */
     let rt = Runtime::new().expect("Tokio runtime failed");
 
-    let process = make_buses_with_writer::<ProcessEvent>(&rt, &exe_dir, db_cfg, "process");
-    let file    = make_buses_with_writer::<FileEvent   >(&rt, &exe_dir, db_cfg, "file");
-    let net     = make_buses_with_writer::<NetworkEvent>(&rt, &exe_dir, db_cfg, "net");
-    let etw     = make_buses_with_writer::<EtwEvent    >(&rt, &exe_dir, db_cfg, "etw");
+    let process = make_buses_with_writer::<ProcessEvent>(&rt, &exe_dir, db_cfg);
+    let file    = make_buses_with_writer::<FileEvent>(&rt, &exe_dir, db_cfg);
+    let net     = make_buses_with_writer::<NetworkEvent>(&rt, &exe_dir, db_cfg);
+    let etw     = make_buses_with_writer::<EtwEvent>(&rt, &exe_dir, db_cfg,);
+    log::info!("run_service(): TokioBuses ready");
 
     let buses = MemoryRingBuses {
         process: process.clone(),
@@ -181,12 +178,16 @@ fn run_service() {
         etw    : etw.clone(),
     };
 
-    let ring = MemoryRing::open().unwrap_or_else(|e| fatal!("ring", "{e}"));
-    spawn_ring_consumer(&rt, ring, buses);
+    let ring = MemoryRing::open().unwrap_or_else(|e| fatal!("run_service(): Error opening the ring: {}", e));
+    log::info!("run_service(): Ring ready");
 
-    /* 5b ▸ SQLite maintenance tasks */
+    spawn_ring_consumer(&rt, ring, buses);
+    log::info!("run_service(): Ring consumers ready");
+
+    // SQLite maintenance tasks
     spawn_ttl_cleanup(&rt, db_path_on_disk.clone(), db_cfg);
     spawn_wal_maintenance(&rt, db_path_on_disk, db_cfg);
+    log::info!("run_service(): SQLite maintenance tasks ready");
 
     /* 6 ▸ Windows SCM / console fallback */
     let (svc_tx, svc_rx) = mpsc::sync_channel(1);
@@ -194,7 +195,7 @@ fn run_service() {
         SERVICE_NAME,
         move |ctrl| match ctrl {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                log::warn!("SCM stop/shutdown requested");
+                log::warn!("run_service(): SCM stop/shutdown requested");
                 let _ = svc_tx.send(());
                 ServiceControlHandlerResult::NoError
             }
@@ -214,6 +215,7 @@ fn run_service() {
     };
     status_handle.set_service_status(status.clone()).unwrap();
 
+
     /* 7 ▸ Directory scanner (blocking thread) */
     status.current_state = ServiceState::Running;
     status_handle.set_service_status(status.clone()).unwrap();
@@ -221,14 +223,14 @@ fn run_service() {
     let groups = cfg.scanner.clone();          // already validated
     let cache_path = exe_dir.join("persistent_cache.json");
     thread::spawn(move || run_scanner(groups, cache_path));
-    log::info!("Service running");
+    log::info!("run_service(): Directory Scanner ready");
 
     /* 8 ▸ Shutdown handshake */
     let _ = svc_rx.recv();                     // block until stop requested
-    log::warn!("Shutdown initiated");
+    log::info!("run_service(): Shutdown requested...");
     status.current_state = ServiceState::Stopped;
     status_handle.set_service_status(status).unwrap();
-    log::info!("Service stopped cleanly");
+    log::info!("run_service(): Service stopped cleanly");
 }
 
 /*──────────────────────── Windows‑service glue ───────────────────────────*/
